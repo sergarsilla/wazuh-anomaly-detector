@@ -1,15 +1,34 @@
-# Run this on the Wazuh manager host. The container reads the live archives log
-# and writes alerts back into the manager's queue socket through bind mounts
-# (UNIX sockets work across bind mounts because it is the same kernel).
+# Run this on the Wazuh manager host. Both services share one built image.
+#
+#   Train the model (one-off, when archives.json has enough normal traffic):
+#       docker compose run --rm trainer
+#
+#   Start the real-time detector (runs forever, restarts on reboot):
+#       docker compose up -d detector
+#
+# UNIX sockets work across bind mounts because it is the same kernel.
 services:
-  anomaly-detector:
+
+  # Long-running real-time anomaly detector (the production service).
+  detector:
     build: .
+    image: wazuh-anomaly-detector
     container_name: wazuh-anomaly-detector
     restart: unless-stopped
     volumes:
-      # Trained model + tuned config (edit on the host, no rebuild needed).
       - ./config:/app/config
       - ./models:/app/models
-      # Wazuh archives log (read-only) and queue socket (read-write).
       - /var/ossec/logs/archives:/var/ossec/logs/archives:ro
       - /var/ossec/queue/ossec:/var/ossec/queue/ossec
+
+  # One-off training job. Guarded by a profile so it never starts automatically;
+  # run it explicitly with `docker compose run --rm trainer`.
+  trainer:
+    build: .
+    image: wazuh-anomaly-detector
+    profiles: ["train"]
+    command: python training/run_training.py
+    volumes:
+      - ./config:/app/config
+      - ./models:/app/models
+      - /var/ossec/logs/archives:/var/ossec/logs/archives:ro
