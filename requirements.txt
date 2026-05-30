@@ -1,0 +1,10 @@
+# Core deep learning (CPU-only build — see README for install instructions)
+torch>=2.2
+
+# Numerical processing & classical ML
+numpy>=1.26
+scikit-learn>=1.4
+pandas>=2.2
+
+# Testing
+pytest>=8.0
