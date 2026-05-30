@@ -128,3 +128,20 @@ class LogVectorizer:
         vector = vector[:INPUT_DIM]
 
         return np.asarray(vector, dtype=np.float32)
+
+
+def standardize(
+    vector: np.ndarray,
+    mean: list[float] | np.ndarray,
+    var: list[float] | np.ndarray,
+) -> np.ndarray:
+    """Apply standard (z-score) scaling using precomputed mean and variance.
+
+    Shared by training/evaluation/inference so the exact same transformation is
+    applied everywhere. Works on a single vector or a 2-D batch via broadcasting.
+    Zero-variance columns are guarded to avoid division by zero.
+    """
+    mean_array = np.asarray(mean, dtype=np.float32)
+    std_array = np.sqrt(np.asarray(var, dtype=np.float32))
+    std_array[std_array == 0.0] = 1.0
+    return ((vector - mean_array) / std_array).astype(np.float32)
