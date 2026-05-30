@@ -1,0 +1,15 @@
+# Run this on the Wazuh manager host. The container reads the live archives log
+# and writes alerts back into the manager's queue socket through bind mounts
+# (UNIX sockets work across bind mounts because it is the same kernel).
+services:
+  anomaly-detector:
+    build: .
+    container_name: wazuh-anomaly-detector
+    restart: unless-stopped
+    volumes:
+      # Trained model + tuned config (edit on the host, no rebuild needed).
+      - ./config:/app/config
+      - ./models:/app/models
+      # Wazuh archives log (read-only) and queue socket (read-write).
+      - /var/ossec/logs/archives:/var/ossec/logs/archives:ro
+      - /var/ossec/queue/ossec:/var/ossec/queue/ossec
