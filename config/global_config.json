@@ -1,0 +1,13 @@
+{
+  "wazuh_archives_path": "/var/ossec/logs/archives/archives.json",
+  "wazuh_socket_path": "/var/ossec/queue/sockets/queue",
+  "model_save_path": "models/model.pt",
+  "input_dim": 64,
+  "latent_dim": 8,
+  "learning_rate": 0.001,
+  "batch_size": 256,
+  "epochs": 50,
+  "anomaly_threshold_tau": 0.0,
+  "scaler_mean": [],
+  "scaler_var": []
+}
