@@ -11,6 +11,7 @@ is swallowed and the loop moves on.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -25,6 +26,11 @@ from src.sanitizer import ISOSanitizer
 
 # Wazuh rule id emitted with each anomaly (must match rules/local_rules.xml).
 ANOMALY_RULE_ID: int = 100100
+
+# Log a heartbeat every N processed lines so it is clear the detector is alive.
+HEARTBEAT_EVERY: int = 1000
+
+logger = logging.getLogger("anomaly_detector")
 
 
 def load_inference_model(config: Dict[str, Any]) -> LogAutoencoder:
@@ -80,13 +86,25 @@ def process_line(
     if mse > tau:
         agent_id = str(event.get("agent", {}).get("id", "000"))
         process_name = str(event.get("data", {}).get("process_name") or "unknown")
-        injector.send_alert(agent_id, ANOMALY_RULE_ID, mse, process_name)
+        sent = injector.send_alert(agent_id, ANOMALY_RULE_ID, mse, process_name)
+        logger.info(
+            "anomaly: agent=%s process=%s score=%.4f tau=%.4f sent=%s",
+            agent_id,
+            process_name,
+            mse,
+            tau,
+            sent,
+        )
 
     return mse
 
 
 def run_realtime_inference(config_path: str = "config/global_config.json") -> None:
     """Run the never-ending real-time anomaly-detection loop."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     config = load_config(config_path)
 
     sanitizer = ISOSanitizer()
@@ -98,8 +116,17 @@ def run_realtime_inference(config_path: str = "config/global_config.json") -> No
     scaler_mean = config["scaler_mean"]
     scaler_var = config["scaler_var"]
 
+    logger.info(
+        "detector started: archives=%s tau=%.4f model=%s",
+        config["wazuh_archives_path"],
+        tau,
+        config["model_save_path"],
+    )
+
+    processed = 0
+    anomalies = 0
     for raw_line in tail_wazuh_archives(config["wazuh_archives_path"]):
-        process_line(
+        mse = process_line(
             raw_line,
             sanitizer,
             vectorizer,
@@ -109,6 +136,11 @@ def run_realtime_inference(config_path: str = "config/global_config.json") -> No
             scaler_mean,
             scaler_var,
         )
+        processed += 1
+        if mse is not None and mse > tau:
+            anomalies += 1
+        if processed % HEARTBEAT_EVERY == 0:
+            logger.info("heartbeat: processed=%d anomalies=%d", processed, anomalies)
 
 
 if __name__ == "__main__":

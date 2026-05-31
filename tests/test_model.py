@@ -19,10 +19,17 @@ def test_latent_bottleneck_dimension() -> None:
     assert latent.shape == (5, 8)
 
 
-def test_final_layer_is_unbounded() -> None:
-    # A linear output layer should allow values outside [-1, 1] / [0, 1],
-    # unlike a Tanh/Sigmoid head. We check the parameter count path indirectly
-    # by confirming the last module is a Linear layer.
+def test_output_layer_is_unbounded() -> None:
+    # The spec requires a pure linear output (no Sigmoid/Tanh) so reconstructions
+    # can span the real range of the scaled features. Check the architecture has
+    # no bounding activation, and that outputs can actually exceed [-1, 1].
     model = LogAutoencoder()
-    last_layer = list(model.decoder.children())[-1]
-    assert isinstance(last_layer, torch.nn.Linear)
+    assert isinstance(list(model.decoder.children())[-1], torch.nn.Linear)
+    assert not any(
+        isinstance(m, (torch.nn.Sigmoid, torch.nn.Tanh)) for m in model.modules()
+    )
+
+    # Drive the net with large inputs; a bounded head could never produce these.
+    torch.manual_seed(0)
+    output = model(torch.randn(256, 64) * 50)
+    assert output.abs().max().item() > 1.0
