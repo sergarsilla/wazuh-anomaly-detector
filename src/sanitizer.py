@@ -111,5 +111,11 @@ class ISOSanitizer:
         if not isinstance(data, dict) or not data:
             return None
 
+        # Skip our own alerts echoed back into the log by logall_json. Without
+        # this guard the detector would re-flag its own injected events in an
+        # endless feedback loop.
+        if "anomaly_detector" in data or event.get("location") == "anomaly_detector":
+            return None
+
         event["data"] = self._sanitize_recursive(data)
         return event
