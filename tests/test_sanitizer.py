@@ -91,3 +91,17 @@ def test_process_event_skips_own_alert_to_avoid_feedback_loop() -> None:
         }
     )
     assert sanitizer.process_event(own_alert) is None
+
+
+def test_process_event_skips_active_response_events() -> None:
+    sanitizer = ISOSanitizer()
+    # An active-response (firewall-drop) event logged by wazuh-execd. Triggered
+    # by our own alert, it must not be re-ingested or it sustains the loop.
+    ar_event = json.dumps(
+        {
+            "agent": {"id": "000"},
+            "location": "/var/ossec/logs/active-responses.log",
+            "data": {"command": "add", "origin": {"module": "wazuh-execd"}},
+        }
+    )
+    assert sanitizer.process_event(ar_event) is None

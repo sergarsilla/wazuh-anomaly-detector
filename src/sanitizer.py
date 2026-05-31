@@ -111,10 +111,15 @@ class ISOSanitizer:
         if not isinstance(data, dict) or not data:
             return None
 
-        # Skip our own alerts echoed back into the log by logall_json. Without
-        # this guard the detector would re-flag its own injected events in an
-        # endless feedback loop.
-        if "anomaly_detector" in data or event.get("location") == "anomaly_detector":
+        # Skip Wazuh's own meta-events (our injected alerts and the
+        # active-response logs they trigger); re-ingesting them would make the
+        # detector flag its own activity in an endless loop.
+        location = str(event.get("location", ""))
+        if (
+            location == "anomaly_detector"
+            or location.startswith("/var/ossec/")
+            or "anomaly_detector" in data
+        ):
             return None
 
         event["data"] = self._sanitize_recursive(data)
