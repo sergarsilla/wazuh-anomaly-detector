@@ -19,7 +19,7 @@ services:
       - ./config:/app/config
       - ./models:/app/models
       - /var/ossec/logs/archives:/var/ossec/logs/archives:ro
-      - /var/ossec/queue/ossec:/var/ossec/queue/ossec
+      - /var/ossec/queue/sockets:/var/ossec/queue/sockets
 
   # One-off training job. Guarded by a profile so it never starts automatically;
   # run it explicitly with `docker compose run --rm trainer`.

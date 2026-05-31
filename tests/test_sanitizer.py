@@ -78,3 +78,16 @@ def test_process_event_returns_none_on_corrupt_json() -> None:
 def test_process_event_returns_none_without_data_block() -> None:
     sanitizer = ISOSanitizer()
     assert sanitizer.process_event(json.dumps({"agent": {"id": "001"}})) is None
+
+
+def test_process_event_skips_own_alert_to_avoid_feedback_loop() -> None:
+    sanitizer = ISOSanitizer()
+    # An alert previously injected by this detector, echoed back via logall_json.
+    own_alert = json.dumps(
+        {
+            "agent": {"id": "000"},
+            "location": "anomaly_detector",
+            "data": {"anomaly_detector": {"agent_id": "000", "anomaly_score": 0.5}},
+        }
+    )
+    assert sanitizer.process_event(own_alert) is None
