@@ -142,7 +142,10 @@ sudo docker compose build
 sudo wc -l /var/ossec/logs/archives/archives.json
 
 # 3. Train the model (one-off: export → train → evaluate)
-sudo docker compose run --rm trainer
+#    --build keeps the trainer image in sync with the current code; it is
+#    required when re-training after a code change (e.g. after a redeploy that
+#    only rebuilt the detector image).
+sudo docker compose run --rm --build trainer
 
 # 4. Install the Wazuh rule and restart the manager (one-off)
 sudo bash -c 'cat rules/local_rules.xml >> /var/ossec/etc/rules/local_rules.xml'

@@ -4,7 +4,7 @@ Chains the three training steps so the model can be (re)built with one call:
 
     1. export_dataset  - turn raw archives into normal/validation .npy vectors
     2. train_model     - train the autoencoder and persist weights + scaler
-    3. calculate_anomaly_threshold - compute tau = mu + 3*sigma
+    3. calculate_anomaly_threshold - compute tau as a high percentile of error
 
 Datasets are written to a temporary directory (they are intermediate artifacts),
 while the model and tuned config land in their configured paths. Designed to run
@@ -51,7 +51,7 @@ def run_training(
         train_model(config_path, normal_path)
 
         if os.path.exists(validation_path):
-            print("[3/3] Computing anomaly threshold (tau = mu + 3*sigma) ...")
+            print("[3/3] Computing anomaly threshold (high percentile of error) ...")
             calculate_anomaly_threshold(config_path, validation_path)
         else:
             print(
