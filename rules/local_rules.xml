@@ -8,13 +8,13 @@
 -->
 <group name="anomaly_detector,">
 
+  <!-- This rule is level 12, so it triggers e-mail when the manager has
+       email_notification enabled and email_alert_level <= 12. Flooding is held
+       back by the detector's per-signature throttle and the manager's
+       email_maxperhour, so e-mail is intentionally NOT suppressed here. -->
   <rule id="100100" level="12">
     <decoded_as>json</decoded_as>
     <field name="anomaly_detector.agent_id">\.+</field>
-    <!-- Email is suppressed at the rule level: the detector already throttles
-         duplicate alerts, but this is a hard backstop against mail floods.
-         Remove this line if you want e-mail on every anomaly. -->
-    <options>no_email_alert</options>
     <description>AI Autoencoder: anomalous behaviour on agent $(anomaly_detector.agent_id) - process $(anomaly_detector.process_name), score $(anomaly_detector.anomaly_score)</description>
     <group>anomaly_detection,gdpr_IV_35.7.d,pci_dss_10.6.1,</group>
   </rule>
