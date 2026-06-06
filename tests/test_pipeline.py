@@ -55,6 +55,8 @@ def test_process_line_injects_alert_when_above_threshold(tmp_path: Path) -> None
             tau=-1.0,
             scaler_mean=IDENTITY_MEAN,
             scaler_var=IDENTITY_VAR,
+            recent_alerts={},
+            cooldown=1800.0,
         )
         assert result is not None
 
@@ -80,5 +82,67 @@ def test_process_line_drops_corrupt_line() -> None:
         tau=0.0,
         scaler_mean=IDENTITY_MEAN,
         scaler_var=IDENTITY_VAR,
+        recent_alerts={},
+        cooldown=1800.0,
+    )
+    assert result is None
+
+
+def test_process_line_throttles_repeated_signature(tmp_path: Path) -> None:
+    """An identical recurring event must alert once, then be suppressed."""
+    socket_path = str(tmp_path / "queue")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(socket_path)
+    server.settimeout(0.2)
+    try:
+        model = LogAutoencoder()
+        model.eval()
+        injector = WazuhSocketInjector(socket_path)
+        recent: dict = {}
+
+        def run() -> None:
+            process_line(
+                _sample_event_line(),
+                ISOSanitizer(),
+                LogVectorizer(),
+                model,
+                injector,
+                tau=-1.0,
+                scaler_mean=IDENTITY_MEAN,
+                scaler_var=IDENTITY_VAR,
+                recent_alerts=recent,
+                cooldown=1800.0,
+            )
+
+        run()
+        assert server.recv(65536)  # first occurrence alerts
+
+        run()  # identical signature within cooldown -> suppressed
+        try:
+            server.recv(65536)
+            assert False, "duplicate alert was not throttled"
+        except socket.timeout:
+            pass
+    finally:
+        server.close()
+
+
+def test_process_line_drops_event_without_process_telemetry() -> None:
+    """Wazuh internal events with no process/command telemetry are skipped."""
+    model = LogAutoencoder()
+    model.eval()
+    injector = WazuhSocketInjector("/nonexistent/socket")
+    noise = json.dumps({"agent": {"id": "000"}, "data": {"level": "3", "srcip": "8.8.8.8"}})
+    result = process_line(
+        noise,
+        ISOSanitizer(),
+        LogVectorizer(),
+        model,
+        injector,
+        tau=-1.0,
+        scaler_mean=IDENTITY_MEAN,
+        scaler_var=IDENTITY_VAR,
+        recent_alerts={},
+        cooldown=1800.0,
     )
     assert result is None

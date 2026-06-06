@@ -42,6 +42,44 @@ _FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     "host_id": ("host_id", "hostname"),
 }
 
+# Fields whose presence marks an event as carrying the process/command
+# behavioural telemetry this detector is built to score. An event lacking all of
+# them (e.g. Wazuh's own internal/periodic events) collapses to an all-zero
+# vector with no behavioural signal, so scoring it only produces noise. Both
+# training and inference skip such events to keep their distributions identical.
+_TELEMETRY_FIELDS: tuple[str, ...] = (
+    "command",
+    "args",
+    "process_name",
+    "process",
+    "exe",
+    "comm",
+)
+
+
+def has_process_telemetry(data: Dict[str, Any]) -> bool:
+    """Return ``True`` if ``data`` carries usable process/command telemetry."""
+    if not isinstance(data, dict):
+        return False
+    return any(
+        data.get(key) is not None and str(data.get(key)).strip()
+        for key in _TELEMETRY_FIELDS
+    )
+
+
+def read_process_name(data: Dict[str, Any]) -> str:
+    """Best-effort human-readable process name from a Wazuh ``data`` block.
+
+    Tries the same aliases the vectorizer uses; falls back to ``"unknown"`` when
+    none resolve (e.g. an event identified only by its command line).
+    """
+    if isinstance(data, dict):
+        for alias in _FIELD_ALIASES["process_name"]:
+            value = data.get(alias)
+            if value is not None and str(value).strip():
+                return str(value)
+    return "unknown"
+
 
 class LogVectorizer:
     """Convert sanitized events into fixed-length numeric feature vectors."""

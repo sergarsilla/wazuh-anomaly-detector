@@ -1,13 +1,18 @@
 """Dynamic anomaly-threshold calculation.
 
 After training, this script measures the reconstruction error distribution on a
-validation set of normal traffic and derives the alarm threshold:
+validation set of normal traffic and derives the alarm threshold as a high
+percentile of that error:
 
-    tau = mu + 3 * sigma
+    tau = percentile(errors, p)        (default p = 99.9)
 
-where ``mu`` and ``sigma`` are the mean and standard deviation of the per-sample
-reconstruction errors. Anything above ``tau`` at inference time is flagged as an
-anomaly. The threshold is written back into the global config.
+Reconstruction errors are bounded below by zero and right-skewed, so the usual
+``mu + 3*sigma`` (which assumes a Gaussian) badly under-estimates the tail and
+floods the dashboard with false positives. A direct high percentile instead
+means "the level only ~0.1% of *normal* traffic exceeds", which is exactly the
+target false-positive rate. The percentile is configurable via ``tau_percentile``
+and ``mu``/``sigma`` are still reported for reference. The threshold is written
+back into the global config.
 """
 
 from __future__ import annotations
@@ -24,8 +29,9 @@ from src.config import load_config, update_config  # noqa: E402
 from src.features import standardize  # noqa: E402
 from src.model import LogAutoencoder  # noqa: E402
 
-# Number of standard deviations above the mean error used as the alarm threshold.
-SIGMA_MULTIPLIER: float = 3.0
+# Default percentile of the validation-error distribution used as the alarm
+# threshold, when the config does not override ``tau_percentile``.
+DEFAULT_TAU_PERCENTILE: float = 99.9
 
 
 def calculate_anomaly_threshold(config_path: str, validation_dataset_path: str) -> float:
@@ -61,10 +67,14 @@ def calculate_anomaly_threshold(config_path: str, validation_dataset_path: str) 
     errors = per_sample_mse.numpy()
     mu = float(np.mean(errors))
     sigma = float(np.std(errors))
-    tau = mu + SIGMA_MULTIPLIER * sigma
+    percentile = float(config.get("tau_percentile", DEFAULT_TAU_PERCENTILE))
+    tau = float(np.percentile(errors, percentile))
 
     update_config(config_path, {"anomaly_threshold_tau": tau})
-    print(f"mu={mu:.6f} sigma={sigma:.6f} -> tau={tau:.6f} (saved to config)")
+    print(
+        f"mu={mu:.6f} sigma={sigma:.6f} "
+        f"p{percentile}={tau:.6f} -> tau={tau:.6f} (saved to config)"
+    )
     return tau
 
 
