@@ -136,6 +136,8 @@ writes to the local Wazuh socket via bind mounts.
 sudo apt install -y docker.io docker-compose-v2
 git clone <YOUR_REPO_URL> wazuh-anomaly-detector
 cd wazuh-anomaly-detector
+# The live config (with the trained scaler/tau) is not tracked; create it once.
+cp config/global_config.example.json config/global_config.json
 sudo docker compose build
 
 # 2. Let archives.json accumulate NORMAL traffic, then check it has data
@@ -172,6 +174,9 @@ uv venv --python 3.13 .venv
 # Install CPU-only torch (avoids pulling multi-GB CUDA deps) + the rest
 VIRTUAL_ENV=.venv uv pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
 VIRTUAL_ENV=.venv uv pip install "numpy>=1.26" "scikit-learn>=1.4" "pandas>=2.2" "pytest>=8.0"
+
+# Create the (untracked) live config from the template
+cp config/global_config.example.json config/global_config.json
 
 # Run the training steps manually
 .venv/bin/python training/export_dataset.py /path/to/archives.json ./data
