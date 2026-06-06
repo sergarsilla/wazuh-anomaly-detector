@@ -15,7 +15,7 @@
   <rule id="100100" level="12">
     <decoded_as>json</decoded_as>
     <field name="anomaly_detector.agent_id">\.+</field>
-    <description>AI Autoencoder: anomalous behaviour on agent $(anomaly_detector.agent_id) - process $(anomaly_detector.process_name), score $(anomaly_detector.anomaly_score)</description>
+    <description>AI Autoencoder: anomalous behaviour on agent $(anomaly_detector.agent_id) user $(anomaly_detector.user) - process $(anomaly_detector.process_name), score $(anomaly_detector.anomaly_score) - cmd: $(anomaly_detector.command)</description>
     <group>anomaly_detection,gdpr_IV_35.7.d,pci_dss_10.6.1,</group>
   </rule>
 

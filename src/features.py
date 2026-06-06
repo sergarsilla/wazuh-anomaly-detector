@@ -81,6 +81,20 @@ def read_process_name(data: Dict[str, Any]) -> str:
     return "unknown"
 
 
+def read_user(data: Dict[str, Any]) -> str:
+    """Best-effort acting user from a Wazuh ``data`` block.
+
+    Tries the same aliases the vectorizer uses (``srcuser`` first for sudo-style
+    events); returns ``""`` when none resolve.
+    """
+    if isinstance(data, dict):
+        for alias in _FIELD_ALIASES["user"]:
+            value = data.get(alias)
+            if value is not None and str(value).strip():
+                return str(value)
+    return ""
+
+
 class LogVectorizer:
     """Convert sanitized events into fixed-length numeric feature vectors."""
 

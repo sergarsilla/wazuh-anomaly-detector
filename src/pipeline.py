@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from src.config import load_config
-from src.features import LogVectorizer, read_process_name, standardize
+from src.features import LogVectorizer, read_process_name, read_user, standardize
 from src.ingester import tail_wazuh_archives
 from src.injector import WazuhSocketInjector
 from src.model import LogAutoencoder
@@ -35,9 +35,11 @@ HEARTBEAT_EVERY: int = 1000
 # again, used when the config does not override ``alert_cooldown_seconds``.
 DEFAULT_ALERT_COOLDOWN: float = 1800.0
 
-# A deduplication signature: (agent_id, process_name, rounded reconstruction
-# error). Identical recurring events share a signature and are throttled.
-AlertSignature = Tuple[str, str, float]
+# A deduplication signature: (agent_id, process_name, command-or-score key).
+# Keying on the actual command means two *different* anomalous commands never
+# collide (which would suppress a real distinct alert); identical recurring
+# events still share a signature and are throttled.
+AlertSignature = Tuple[str, str, str]
 
 logger = logging.getLogger("anomaly_detector")
 
@@ -123,15 +125,37 @@ def process_line(
         return None
 
     if mse > tau:
-        agent_id = str(event.get("agent", {}).get("id", "000"))
         data = event.get("data", {})
-        process_name = read_process_name(data if isinstance(data, dict) else {})
-        signature: AlertSignature = (agent_id, process_name, round(mse, 4))
+        if not isinstance(data, dict):
+            data = {}
+        agent = event.get("agent", {})
+        agent = agent if isinstance(agent, dict) else {}
+        agent_id = str(agent.get("id", "000"))
+        agent_name = str(agent.get("name", ""))
+        process_name = read_process_name(data)
+        user = read_user(data)
+        command = str(data.get("command") or data.get("args") or "")
+        timestamp = str(event.get("timestamp", ""))
+
+        # Dedup on the command itself (fall back to the score when there is no
+        # command) so distinct anomalies are never collapsed together.
+        command_key = command if command else f"score:{round(mse, 4)}"
+        signature: AlertSignature = (agent_id, process_name, command_key)
         if _should_alert(recent_alerts, signature, cooldown, time.monotonic()):
-            sent = injector.send_alert(agent_id, ANOMALY_RULE_ID, mse, process_name)
-            logger.info(
-                "anomaly: agent=%s process=%s score=%.4f tau=%.4f sent=%s",
+            sent = injector.send_alert(
                 agent_id,
+                ANOMALY_RULE_ID,
+                mse,
+                process_name,
+                command=command,
+                user=user,
+                timestamp=timestamp,
+                agent_name=agent_name,
+            )
+            logger.info(
+                "anomaly: agent=%s user=%s process=%s score=%.4f tau=%.4f sent=%s",
+                agent_id,
+                user or "-",
                 process_name,
                 mse,
                 tau,
