@@ -11,13 +11,15 @@ is swallowed and the loop moves on.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from src.config import load_config
-from src.features import LogVectorizer, standardize
+from src.features import LogVectorizer, read_process_name, standardize
 from src.ingester import tail_wazuh_archives
 from src.injector import WazuhSocketInjector
 from src.model import LogAutoencoder
@@ -25,6 +27,43 @@ from src.sanitizer import ISOSanitizer
 
 # Wazuh rule id emitted with each anomaly (must match rules/local_rules.xml).
 ANOMALY_RULE_ID: int = 100100
+
+# Log a heartbeat every N processed lines so it is clear the detector is alive.
+HEARTBEAT_EVERY: int = 1000
+
+# Default cooldown (seconds) before an identical anomaly signature can alert
+# again, used when the config does not override ``alert_cooldown_seconds``.
+DEFAULT_ALERT_COOLDOWN: float = 1800.0
+
+# A deduplication signature: (agent_id, process_name, rounded reconstruction
+# error). Identical recurring events share a signature and are throttled.
+AlertSignature = Tuple[str, str, float]
+
+logger = logging.getLogger("anomaly_detector")
+
+
+def _should_alert(
+    recent_alerts: Dict[AlertSignature, float],
+    signature: AlertSignature,
+    cooldown: float,
+    now: float,
+) -> bool:
+    """Decide whether ``signature`` may alert now, honouring the cooldown.
+
+    Records the alert time on success and opportunistically evicts expired
+    entries so the cache cannot grow without bound.
+    """
+    last = recent_alerts.get(signature)
+    if last is not None and (now - last) < cooldown:
+        return False
+
+    # Prune stale entries (older than one cooldown window) while we are here.
+    if recent_alerts:
+        for key in [k for k, t in recent_alerts.items() if (now - t) >= cooldown]:
+            del recent_alerts[key]
+
+    recent_alerts[signature] = now
+    return True
 
 
 def load_inference_model(config: Dict[str, Any]) -> LogAutoencoder:
@@ -61,8 +100,14 @@ def process_line(
     tau: float,
     scaler_mean: List[float],
     scaler_var: List[float],
+    recent_alerts: Dict[AlertSignature, float],
+    cooldown: float,
 ) -> Optional[float]:
     """Process one raw log line; inject an alert if it scores above ``tau``.
+
+    Alerts for an identical signature ``(agent, process, score)`` are throttled
+    to at most one per ``cooldown`` seconds so a recurring benign event cannot
+    flood the dashboard.
 
     Returns the reconstruction error, or ``None`` if the line was dropped
     (corrupt, no telemetry, or a transient processing error).
@@ -79,14 +124,29 @@ def process_line(
 
     if mse > tau:
         agent_id = str(event.get("agent", {}).get("id", "000"))
-        process_name = str(event.get("data", {}).get("process_name") or "unknown")
-        injector.send_alert(agent_id, ANOMALY_RULE_ID, mse, process_name)
+        data = event.get("data", {})
+        process_name = read_process_name(data if isinstance(data, dict) else {})
+        signature: AlertSignature = (agent_id, process_name, round(mse, 4))
+        if _should_alert(recent_alerts, signature, cooldown, time.monotonic()):
+            sent = injector.send_alert(agent_id, ANOMALY_RULE_ID, mse, process_name)
+            logger.info(
+                "anomaly: agent=%s process=%s score=%.4f tau=%.4f sent=%s",
+                agent_id,
+                process_name,
+                mse,
+                tau,
+                sent,
+            )
 
     return mse
 
 
 def run_realtime_inference(config_path: str = "config/global_config.json") -> None:
     """Run the never-ending real-time anomaly-detection loop."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     config = load_config(config_path)
 
     sanitizer = ISOSanitizer()
@@ -97,9 +157,22 @@ def run_realtime_inference(config_path: str = "config/global_config.json") -> No
     tau = float(config["anomaly_threshold_tau"])
     scaler_mean = config["scaler_mean"]
     scaler_var = config["scaler_var"]
+    cooldown = float(config.get("alert_cooldown_seconds", DEFAULT_ALERT_COOLDOWN))
 
+    # Per-signature throttle state for the lifetime of the process.
+    recent_alerts: Dict[AlertSignature, float] = {}
+
+    logger.info(
+        "detector started: archives=%s tau=%.4f model=%s",
+        config["wazuh_archives_path"],
+        tau,
+        config["model_save_path"],
+    )
+
+    processed = 0
+    anomalies = 0
     for raw_line in tail_wazuh_archives(config["wazuh_archives_path"]):
-        process_line(
+        mse = process_line(
             raw_line,
             sanitizer,
             vectorizer,
@@ -108,7 +181,14 @@ def run_realtime_inference(config_path: str = "config/global_config.json") -> No
             tau,
             scaler_mean,
             scaler_var,
+            recent_alerts,
+            cooldown,
         )
+        processed += 1
+        if mse is not None and mse > tau:
+            anomalies += 1
+        if processed % HEARTBEAT_EVERY == 0:
+            logger.info("heartbeat: processed=%d anomalies=%d", processed, anomalies)
 
 
 if __name__ == "__main__":

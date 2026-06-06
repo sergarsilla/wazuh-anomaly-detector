@@ -8,6 +8,8 @@
   "batch_size": 256,
   "epochs": 50,
   "anomaly_threshold_tau": 0.0,
+  "tau_percentile": 99.9,
+  "alert_cooldown_seconds": 1800,
   "scaler_mean": [],
   "scaler_var": []
 }

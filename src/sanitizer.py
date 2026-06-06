@@ -15,6 +15,8 @@ import json
 import re
 from typing import Any, Dict, Optional
 
+from src.features import has_process_telemetry
+
 # Constant markers used for irreversible substitution.
 MASKED_CREDENTIAL: str = "[MASKED_CREDENTIAL]"
 MASKED_IP: str = "10.0.0.0"
@@ -120,6 +122,13 @@ class ISOSanitizer:
             or location.startswith("/var/ossec/")
             or "anomaly_detector" in data
         ):
+            return None
+
+        # Only events carrying process/command telemetry hold behavioural
+        # signal. Skip the rest (Wazuh's internal/periodic events, keepalives,
+        # etc.); feeding the model their all-zero vectors only produces noise
+        # and, with a tight threshold, a flood of meaningless alerts.
+        if not has_process_telemetry(data):
             return None
 
         event["data"] = self._sanitize_recursive(data)
