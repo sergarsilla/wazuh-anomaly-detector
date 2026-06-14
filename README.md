@@ -44,7 +44,8 @@ The system runs in **two phases**:
 The core idea: an autoencoder is trained **only on normal traffic**. It learns to
 reconstruct normal events with low error, but struggles to reconstruct anything it
 has never seen (an attack), producing a high **reconstruction error**. When that
-error exceeds the dynamic threshold `τ = μ + 3σ`, the event is flagged as an anomaly.
+error exceeds the dynamic threshold `τ` (a high percentile of the normal-traffic
+error, p99.9 by default), the event is flagged as an anomaly.
 
 > 📊 A visual, step-by-step walkthrough lives in [`docs/flujo.html`](docs/flujo.html)
 > — open it in a browser.
@@ -110,7 +111,7 @@ wazuh-anomaly-detector/
 ├── training/
 │   ├── export_dataset.py       # Build .npy datasets from raw archives.json
 │   ├── train.py                # Train the autoencoder + fit scaler
-│   ├── evaluate.py             # Compute τ = μ + 3σ
+│   ├── evaluate.py             # Compute τ (high percentile of error)
 │   └── run_training.py         # One-shot: export → train → evaluate
 ├── rules/
 │   └── local_rules.xml         # Custom Wazuh rule (id 100100)
@@ -201,6 +202,8 @@ All runtime settings live in [`config/global_config.json`](config/global_config.
 | `input_dim` / `latent_dim` | Vector size (64) and bottleneck size (8) |
 | `learning_rate` / `batch_size` / `epochs` | Training hyperparameters |
 | `anomaly_threshold_tau` | Dynamic alarm threshold (written by `evaluate.py`) |
+| `tau_percentile` | Percentile of normal-traffic error used as the threshold (default 99.9) |
+| `alert_cooldown_seconds` | Per-signature throttle between repeat alerts, in seconds (default 1800) |
 | `scaler_mean` / `scaler_var` | Normalization params (written by `train.py`) |
 
 > `anomaly_threshold_tau`, `scaler_mean` and `scaler_var` start empty/zero and are

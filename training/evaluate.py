@@ -35,7 +35,7 @@ DEFAULT_TAU_PERCENTILE: float = 99.9
 
 
 def calculate_anomaly_threshold(config_path: str, validation_dataset_path: str) -> float:
-    """Compute and persist ``tau = mu + 3*sigma`` from validation errors.
+    """Compute and persist ``tau`` as a high percentile of the validation errors.
 
     Args:
         config_path: Path to the global JSON config (must already contain the
