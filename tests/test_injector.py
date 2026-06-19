@@ -47,6 +47,51 @@ def test_send_alert_delivers_formatted_payload(tmp_path: Path) -> None:
         server.close()
 
 
+def test_send_alert_includes_severity_and_top_features(tmp_path: Path) -> None:
+    socket_path = str(tmp_path / "queue")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(socket_path)
+    try:
+        injector = WazuhSocketInjector(socket_path)
+        top_features = [
+            {"feature": "command_entropy", "message": "command entropy above normal",
+             "contribution_pct": 72.0},
+        ]
+        assert injector.send_alert(
+            "001",
+            100100,
+            0.5,
+            "proc",
+            severity=426.18,
+            top_features=top_features,
+        )
+        alert = json.loads(
+            server.recv(65536).decode("utf-8")[len(QUEUE_PREFIX):]
+        )["anomaly_detector"]
+        assert alert["severity"] == 426.18
+        assert alert["top_features"] == top_features
+        # A flat summary string is derived for the dashboard/rule description.
+        assert alert["explanation"] == "command entropy above normal"
+    finally:
+        server.close()
+
+
+def test_send_alert_omits_explainability_fields_when_absent(tmp_path: Path) -> None:
+    socket_path = str(tmp_path / "queue")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(socket_path)
+    try:
+        injector = WazuhSocketInjector(socket_path)
+        injector.send_alert("001", 100100, 0.5, "proc")
+        alert = json.loads(
+            server.recv(65536).decode("utf-8")[len(QUEUE_PREFIX):]
+        )["anomaly_detector"]
+        assert "severity" not in alert
+        assert "top_features" not in alert
+    finally:
+        server.close()
+
+
 def test_send_alert_truncates_oversized_command(tmp_path: Path) -> None:
     from src.injector import MAX_COMMAND_LEN
 
