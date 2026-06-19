@@ -9,7 +9,7 @@ import torch
 from src.features import LogVectorizer
 from src.injector import QUEUE_PREFIX, WazuhSocketInjector
 from src.model import LogAutoencoder
-from src.pipeline import process_line, reconstruction_error
+from src.pipeline import process_line, reconstruction_details, reconstruction_error
 from src.sanitizer import ISOSanitizer
 
 INPUT_DIM = 64
@@ -34,6 +34,53 @@ def test_reconstruction_error_returns_non_negative_float() -> None:
     error = reconstruction_error(model, vector, IDENTITY_MEAN, IDENTITY_VAR)
     assert isinstance(error, float)
     assert error >= 0.0
+
+
+def test_reconstruction_details_per_dim_mean_equals_mse() -> None:
+    torch.manual_seed(0)
+    model = LogAutoencoder()
+    model.eval()
+    vector = LogVectorizer().extract_vector(json.loads(_sample_event_line()))
+    mse, normalized, per_dim = reconstruction_details(
+        model, vector, IDENTITY_MEAN, IDENTITY_VAR
+    )
+    assert per_dim.shape == (INPUT_DIM,)
+    assert normalized.shape == (INPUT_DIM,)
+    assert (per_dim >= 0.0).all()
+    assert abs(float(per_dim.mean()) - mse) < 1e-6
+    # Same scalar MSE as the thin wrapper.
+    assert abs(reconstruction_error(model, vector, IDENTITY_MEAN, IDENTITY_VAR) - mse) < 1e-6
+
+
+def test_process_line_alert_carries_severity_and_explanation(tmp_path: Path) -> None:
+    socket_path = str(tmp_path / "queue")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(socket_path)
+    try:
+        model = LogAutoencoder()
+        model.eval()
+        injector = WazuhSocketInjector(socket_path)
+        # A small positive tau triggers an alert and yields a real severity ratio.
+        process_line(
+            _sample_event_line(),
+            ISOSanitizer(),
+            LogVectorizer(),
+            model,
+            injector,
+            tau=1e-6,
+            scaler_mean=IDENTITY_MEAN,
+            scaler_var=IDENTITY_VAR,
+            recent_alerts={},
+            cooldown=1800.0,
+        )
+        alert = json.loads(
+            server.recv(65536).decode("utf-8")[len(QUEUE_PREFIX):]
+        )["anomaly_detector"]
+        assert alert["severity"] > 1.0  # score is above tau
+        assert isinstance(alert["top_features"], list) and alert["top_features"]
+        assert {"feature", "message", "contribution_pct"} <= set(alert["top_features"][0])
+    finally:
+        server.close()
 
 
 def test_process_line_injects_alert_when_above_threshold(tmp_path: Path) -> None:

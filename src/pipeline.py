@@ -19,7 +19,13 @@ import numpy as np
 import torch
 
 from src.config import load_config
-from src.features import LogVectorizer, read_process_name, read_user, standardize
+from src.features import (
+    LogVectorizer,
+    explain_anomaly,
+    read_process_name,
+    read_user,
+    standardize,
+)
 from src.ingester import tail_wazuh_archives
 from src.injector import WazuhSocketInjector
 from src.model import LogAutoencoder
@@ -79,6 +85,26 @@ def load_inference_model(config: Dict[str, Any]) -> LogAutoencoder:
     return model
 
 
+def reconstruction_details(
+    model: LogAutoencoder,
+    vector: np.ndarray,
+    scaler_mean: List[float],
+    scaler_var: List[float],
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Standardize a vector and return ``(mse, normalized, per_dim_error)``.
+
+    ``per_dim_error`` is the squared error per dimension; its mean is the MSE.
+    Keeping the per-dimension breakdown lets callers explain *which* features
+    drove the anomaly, not just how large it was.
+    """
+    normalized = standardize(vector, scaler_mean, scaler_var)
+    with torch.no_grad():
+        tensor = torch.from_numpy(normalized).unsqueeze(0)  # add batch dim
+        reconstruction = model(tensor)
+        per_dim = ((tensor - reconstruction) ** 2).squeeze(0).numpy()
+    return float(per_dim.mean()), normalized, per_dim
+
+
 def reconstruction_error(
     model: LogAutoencoder,
     vector: np.ndarray,
@@ -86,11 +112,8 @@ def reconstruction_error(
     scaler_var: List[float],
 ) -> float:
     """Standardize a single feature vector and return its reconstruction MSE."""
-    normalized = standardize(vector, scaler_mean, scaler_var)
-    with torch.no_grad():
-        tensor = torch.from_numpy(normalized).unsqueeze(0)  # add batch dim
-        reconstruction = model(tensor)
-        return float(torch.mean((tensor - reconstruction) ** 2).item())
+    mse, _, _ = reconstruction_details(model, vector, scaler_mean, scaler_var)
+    return mse
 
 
 def process_line(
@@ -120,7 +143,9 @@ def process_line(
 
     try:
         vector = vectorizer.extract_vector(event)
-        mse = reconstruction_error(model, vector, scaler_mean, scaler_var)
+        mse, normalized, per_dim_error = reconstruction_details(
+            model, vector, scaler_mean, scaler_var
+        )
     except Exception:  # noqa: BLE001 - one bad event must not stop the pipeline
         return None
 
@@ -142,6 +167,11 @@ def process_line(
         command_key = command if command else f"score:{round(mse, 4)}"
         signature: AlertSignature = (agent_id, process_name, command_key)
         if _should_alert(recent_alerts, signature, cooldown, time.monotonic()):
+            top_features = explain_anomaly(normalized, per_dim_error)
+            # Severity relative to the threshold: how many times over tau the
+            # score is. More interpretable and host-comparable than raw MSE;
+            # only meaningful for a positive tau.
+            severity = round(mse / tau, 2) if tau > 0 else None
             sent = injector.send_alert(
                 agent_id,
                 ANOMALY_RULE_ID,
@@ -151,6 +181,8 @@ def process_line(
                 user=user,
                 timestamp=timestamp,
                 agent_name=agent_name,
+                severity=severity,
+                top_features=top_features,
             )
             logger.info(
                 "anomaly: agent=%s user=%s process=%s score=%.4f tau=%.4f sent=%s",
