@@ -25,6 +25,13 @@ import numpy as np
 INPUT_DIM: int = 64
 HASH_SIZE: int = 8
 
+# Continuous behavioural features, in vector order (dimensions 0..2).
+CONTINUOUS_FEATURES: tuple[str, ...] = (
+    "command_length",
+    "command_entropy",
+    "syscall_count",
+)
+
 # Categorical fields hashed into the vector. Each contributes HASH_SIZE elements.
 CATEGORICAL_FIELDS: tuple[str, ...] = (
     "process_name",
@@ -180,6 +187,81 @@ class LogVectorizer:
         vector = vector[:INPUT_DIM]
 
         return np.asarray(vector, dtype=np.float32)
+
+
+# Logical feature -> direction-aware human-readable templates. Continuous
+# features have a meaningful direction (the standardized value's sign says
+# whether the observed value is above or below the benign mean); hashed
+# categorical features do not, so they get a single template.
+_FEATURE_DESCRIPTIONS: Dict[str, tuple[str, ...]] = {
+    "command_length": ("command length above normal", "command length below normal"),
+    "command_entropy": ("command entropy above normal", "command entropy below normal"),
+    "syscall_count": ("system-call count above normal", "system-call count below normal"),
+    "process_name": ("process name pattern unusual",),
+    "parent_name": ("parent process pattern unusual",),
+    "user": ("user pattern unusual",),
+    "host_id": ("host pattern unusual",),
+}
+
+
+def feature_layout() -> List[tuple[str, int, int]]:
+    """Return ``(logical_name, start, end)`` spans over the feature vector.
+
+    Each continuous feature occupies a single dimension; each categorical field
+    occupies ``HASH_SIZE`` contiguous dimensions. The trailing deterministic
+    zero-padding is intentionally omitted: those dimensions always reconstruct
+    to ~0 error and carry no behavioural meaning.
+    """
+    layout: List[tuple[str, int, int]] = []
+    index = 0
+    for name in CONTINUOUS_FEATURES:
+        layout.append((name, index, index + 1))
+        index += 1
+    for field in CATEGORICAL_FIELDS:
+        layout.append((field, index, index + HASH_SIZE))
+        index += HASH_SIZE
+    return layout
+
+
+def explain_anomaly(
+    normalized: np.ndarray,
+    per_dim_error: np.ndarray,
+    top_k: int = 3,
+) -> List[Dict[str, Any]]:
+    """Translate a per-dimension reconstruction error into top contributors.
+
+    Aggregates the squared error of each logical feature (summing the
+    ``HASH_SIZE`` dimensions of a hashed categorical field into one score),
+    ranks them, and returns the ``top_k`` with a natural-language message and
+    their share of the total error. This turns "the score is high" into "*why*
+    it is high", which both a human analyst and a downstream LLM triage layer
+    can act on.
+
+    ``normalized`` is the standardized feature vector (its sign gives the
+    direction for continuous features); ``per_dim_error`` is ``(x - x̂)²`` per
+    dimension.
+    """
+    total = float(per_dim_error.sum())
+    contributions: List[Dict[str, Any]] = []
+    for name, start, end in feature_layout():
+        error = float(per_dim_error[start:end].sum())
+        if error <= 0.0:
+            continue
+        templates = _FEATURE_DESCRIPTIONS[name]
+        if len(templates) == 2:
+            message = templates[0] if float(normalized[start]) >= 0.0 else templates[1]
+        else:
+            message = templates[0]
+        contributions.append(
+            {
+                "feature": name,
+                "message": message,
+                "contribution_pct": round(100.0 * error / total, 1) if total > 0 else 0.0,
+            }
+        )
+
+    contributions.sort(key=lambda item: item["contribution_pct"], reverse=True)
+    return contributions[:top_k]
 
 
 def standardize(
