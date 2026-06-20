@@ -12,8 +12,11 @@ inside the Docker "trainer" service, but works as a plain script too.
 
 Env vars (used when run with no CLI args, e.g. inside Docker):
     CONFIG_PATH    - path to the global config (default: config/global_config.json)
-    ARCHIVES_PATH  - path to the raw archives.json
-                     (default: /var/ossec/logs/archives/archives.json)
+    ARCHIVES_PATH  - file, glob or directory of archives to train on. Defaults to
+                     the archives directory (default: /var/ossec/logs/archives),
+                     so the rotated *.json.gz history is used, not just today.
+    MAX_EVENTS     - optional cap on events processed (guards memory/time on a
+                     large history); unset means use everything.
 """
 
 from __future__ import annotations
@@ -33,11 +36,14 @@ def run_training(
     config_path: str,
     archives_path: str,
     validation_ratio: float = 0.2,
+    max_events: "int | None" = None,
 ) -> None:
-    """Export, train and compute the threshold from a raw archives log."""
+    """Export, train and compute the threshold from archive logs."""
     with tempfile.TemporaryDirectory() as work_dir:
         print(f"[1/3] Exporting feature vectors from {archives_path} ...")
-        total = export_dataset(archives_path, work_dir, validation_ratio=validation_ratio)
+        total = export_dataset(
+            archives_path, work_dir, validation_ratio=validation_ratio, max_events=max_events
+        )
         if total == 0:
             raise SystemExit(
                 "No usable events found in the archives log; nothing to train on. "
@@ -64,7 +70,7 @@ def run_training(
 
 if __name__ == "__main__":
     config = os.environ.get("CONFIG_PATH", "config/global_config.json")
-    archives = os.environ.get(
-        "ARCHIVES_PATH", "/var/ossec/logs/archives/archives.json"
-    )
-    run_training(config, archives)
+    archives = os.environ.get("ARCHIVES_PATH", "/var/ossec/logs/archives")
+    max_events_env = os.environ.get("MAX_EVENTS")
+    max_events = int(max_events_env) if max_events_env else None
+    run_training(config, archives, max_events=max_events)
