@@ -9,7 +9,7 @@ into the Wazuh dashboard.
 <p>
   <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-CPU-ee4c2c">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-27%20passing-3fb950">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-48%20passing-3fb950">
   <img alt="Docker" src="https://img.shields.io/badge/docker-ready-2496ed">
 </p>
 
@@ -47,18 +47,24 @@ has never seen (an attack), producing a high **reconstruction error**. When that
 error exceeds the dynamic threshold `τ` (a high percentile of the normal-traffic
 error, p99.9 by default), the event is flagged as an anomaly.
 
-> 📊 A visual, step-by-step walkthrough lives in [`docs/flujo.html`](docs/flujo.html)
-> — open it in a browser.
+Training reads the **full rotated history** Wazuh keeps under
+`/var/ossec/logs/archives/` (the gzipped daily archives), not just the current
+day, so the model learns a representative "normal" and over-flags far less.
 
 ---
 
 ## ✨ Features
 
 - **Unsupervised** — no labelled attack data required; learns from normal traffic.
+- **Explainable alerts** — each alert carries a calibrated `severity` (how many times
+  over `τ`) plus the top per-feature contributors in plain language, so a human (and a
+  downstream LLM triage layer) sees *why* an event is anomalous, not just *how much*.
 - **Privacy-first (ISO 27001)** — public IPs, emails, JWTs, API keys, credentials and
   private keys are irreversibly masked *before* any analysis.
 - **Resilient ingestion** — `tail -f` style reader that survives missing files,
   partial lines and log rotation (inode tracking).
+- **History-aware training** — trains on the gzipped rotated archive history, not just
+  the current day.
 - **CPU-only** — lightweight inference, no GPU needed.
 - **Native Wazuh integration** — alerts are injected into the manager's queue socket
   and surfaced via a custom rule in the dashboard.
@@ -109,15 +115,18 @@ wazuh-anomaly-detector/
 │   ├── pipeline.py             # Real-time inference loop
 │   └── config.py               # Config load/save helpers
 ├── training/
-│   ├── export_dataset.py       # Build .npy datasets from raw archives.json
+│   ├── export_dataset.py       # Build .npy datasets from the archive history (gz-aware)
 │   ├── train.py                # Train the autoencoder + fit scaler
 │   ├── evaluate.py             # Compute τ (high percentile of error)
 │   └── run_training.py         # One-shot: export → train → evaluate
+├── scripts/
+│   ├── calibrate_threshold.py  # Compare τ candidates + false-positive rates (advisory)
+│   └── profile_archives.py     # Profile archives.json: event/decoder/field coverage
 ├── rules/
 │   └── local_rules.xml         # Custom Wazuh rule (id 100100)
 ├── models/                     # Trained model.pt lands here (generated)
-├── tests/                      # 27 pytest cases
-├── docs/flujo.html             # Visual flow explanation
+├── tests/                      # 48 pytest cases
+├── .github/workflows/ci.yml    # CI: install CPU torch + run pytest
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -141,14 +150,17 @@ cd wazuh-anomaly-detector
 cp config/global_config.example.json config/global_config.json
 sudo docker compose build
 
-# 2. Let archives.json accumulate NORMAL traffic, then check it has data
-sudo wc -l /var/ossec/logs/archives/archives.json
+# 2. Let Wazuh accumulate NORMAL traffic. Training uses the whole archive
+#    directory by default (the rotated *.json.gz history), so a few days/weeks
+#    of retained archives is plenty — check there is data:
+sudo du -sh /var/ossec/logs/archives
 
-# 3. Train the model (one-off: export → train → evaluate)
+# 3. Train the model (one-off: export → train → evaluate).
 #    --build keeps the trainer image in sync with the current code; it is
-#    required when re-training after a code change (e.g. after a redeploy that
-#    only rebuilt the detector image).
+#    required when re-training after a code change. Cap memory on a large
+#    history with MAX_EVENTS, or point ARCHIVES_PATH at a single file/glob.
 sudo docker compose run --rm --build trainer
+# e.g. cap to 1M events:  sudo docker compose run --rm -e MAX_EVENTS=1000000 trainer
 
 # 4. Install the Wazuh rule and restart the manager (one-off)
 sudo bash -c 'cat rules/local_rules.xml >> /var/ossec/etc/rules/local_rules.xml'
@@ -230,9 +242,10 @@ All runtime settings live in [`config/global_config.json`](config/global_config.
 .venv/bin/python -m pytest tests/
 ```
 
-The suite (27 tests) covers PII masking, log-rotation handling, feature extraction,
-the autoencoder, the end-to-end training/threshold pipeline, socket injection and the
-dataset exporter.
+The suite (48 tests) covers PII masking, log-rotation handling, feature extraction,
+per-feature anomaly explanations, the autoencoder, the end-to-end training/threshold
+pipeline, socket injection, the gz-aware history exporter and the threshold-calibration
+and archive-profiling helpers.
 
 ---
 
@@ -248,5 +261,4 @@ your log-protection and retention policies.
 
 ## 📄 License
 
-No license has been defined for this repository yet. Add a `LICENSE` file before
-distributing.
+Licensed under the Apache License 2.0 — see [`LICENSE`](LICENSE).
