@@ -2,7 +2,15 @@
 
 import numpy as np
 
-from src.features import HASH_SIZE, INPUT_DIM, LogVectorizer
+from src.features import (
+    CATEGORICAL_FIELDS,
+    CONTINUOUS_FEATURES,
+    HASH_SIZE,
+    INPUT_DIM,
+    LogVectorizer,
+    explain_anomaly,
+    feature_layout,
+)
 
 
 def test_entropy_zero_for_uniform_string() -> None:
@@ -53,3 +61,50 @@ def test_extract_vector_handles_missing_data() -> None:
     vector = vectorizer.extract_vector({"data": {}})
     assert vector.shape == (INPUT_DIM,)
     assert vector.dtype == np.float32
+
+
+def test_feature_layout_spans_continuous_then_categorical() -> None:
+    layout = feature_layout()
+    # Three single-dimension continuous features, then HASH_SIZE per categorical.
+    expected = len(CONTINUOUS_FEATURES) + len(CATEGORICAL_FIELDS)
+    assert len(layout) == expected
+    for name, start, end in layout[: len(CONTINUOUS_FEATURES)]:
+        assert end - start == 1
+    for name, start, end in layout[len(CONTINUOUS_FEATURES):]:
+        assert end - start == HASH_SIZE
+    # Spans are contiguous and stop before the zero padding.
+    assert layout[0][1] == 0
+    assert layout[-1][2] == len(CONTINUOUS_FEATURES) + len(CATEGORICAL_FIELDS) * HASH_SIZE
+
+
+def test_explain_anomaly_ranks_top_contributors() -> None:
+    per_dim = np.zeros(INPUT_DIM, dtype=np.float32)
+    normalized = np.zeros(INPUT_DIM, dtype=np.float32)
+    # command_entropy (index 1) dominates, observed above the benign mean.
+    per_dim[1] = 9.0
+    normalized[1] = 2.5
+    # process_name hash bucket (index 3) is a weaker contributor.
+    per_dim[3] = 1.0
+
+    top = explain_anomaly(normalized, per_dim, top_k=3)
+
+    assert top[0]["feature"] == "command_entropy"
+    assert top[0]["message"] == "command entropy above normal"
+    assert top[0]["contribution_pct"] == 90.0
+    assert top[1]["feature"] == "process_name"
+    assert top[1]["message"] == "process name pattern unusual"
+
+
+def test_explain_anomaly_direction_below_normal() -> None:
+    per_dim = np.zeros(INPUT_DIM, dtype=np.float32)
+    normalized = np.zeros(INPUT_DIM, dtype=np.float32)
+    per_dim[0] = 4.0  # command_length
+    normalized[0] = -1.7  # observed below the benign mean
+
+    top = explain_anomaly(normalized, per_dim, top_k=1)
+    assert top[0]["message"] == "command length below normal"
+
+
+def test_explain_anomaly_empty_when_no_error() -> None:
+    zeros = np.zeros(INPUT_DIM, dtype=np.float32)
+    assert explain_anomaly(zeros, zeros) == []
