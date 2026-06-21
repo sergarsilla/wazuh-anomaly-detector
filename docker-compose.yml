@@ -31,4 +31,5 @@ services:
     volumes:
       - ./config:/app/config
       - ./models:/app/models
+      - ./data:/app/data
       - /var/ossec/logs/archives:/var/ossec/logs/archives:ro
