@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 # trained model and tuned thresholds can change without rebuilding the image.
 COPY src/ ./src/
 COPY training/ ./training/
+COPY scripts/ ./scripts/
 
 # Run the real-time inference loop.
 CMD ["python", "-m", "src.pipeline"]
