@@ -18,8 +18,14 @@ Unlike ``evaluate.py``, this script never writes anything back: it is a tuning
 aid you run by hand to choose ``tau_percentile`` with evidence. Production
 ``tau`` is still computed and persisted by ``evaluate.py``.
 
+The validation input may be a pre-exported ``.npy`` array OR a raw archives
+source (a file, a glob or the ``/var/ossec/logs/archives`` directory): in the
+latter case the vectors are built on the fly with the same sanitizer and
+vectorizer as production, so calibration needs no prior export step.
+
 Usage:
-    python scripts/calibrate_threshold.py [config.json] [validation.npy] [target_fp]
+    python scripts/calibrate_threshold.py [config.json] [validation_source] [target_fp]
+    # validation_source: a .npy file, or archives path/dir/glob
 """
 
 from __future__ import annotations
@@ -40,9 +46,28 @@ from src.model import LogAutoencoder  # noqa: E402
 DEFAULT_TARGET_FP: float = 0.001  # 0.1%
 
 
+def _load_validation_vectors(source: str) -> np.ndarray:
+    """Load vectors from a ``.npy`` file, or build them from raw archive logs.
+
+    Anything not ending in ``.npy`` is treated as an archives source (file,
+    glob or directory) and vectorised on the fly, reusing the training exporter
+    so no separate export step is required.
+    """
+    if source.endswith(".npy"):
+        return np.load(source).astype(np.float32)
+    from training.export_dataset import build_vectors  # local import: optional dep
+
+    return build_vectors(source)
+
+
 def reconstruction_errors(config: dict, validation_dataset_path: str) -> np.ndarray:
     """Return the per-sample reconstruction MSE for a normal validation set."""
-    dataset = np.load(validation_dataset_path).astype(np.float32)
+    dataset = _load_validation_vectors(validation_dataset_path)
+    if dataset.size == 0:
+        raise SystemExit(
+            f"No usable events found in '{validation_dataset_path}'. "
+            "Point it at archives with normal traffic or a non-empty .npy."
+        )
     normalized = standardize(dataset, config["scaler_mean"], config["scaler_var"])
 
     model = LogAutoencoder(
