@@ -74,13 +74,23 @@ def _open_archive(path: str) -> IO[str]:
 
 
 def iter_archive_lines(archives_path: str) -> Iterator[str]:
-    """Yield non-empty, stripped lines across every resolved archive file."""
+    """Yield non-empty, stripped lines across every resolved archive file.
+
+    A rotated archive can be truncated — Wazuh was still writing when the day
+    rolled over, or the disk filled — and decompression then raises partway
+    through. Reading the whole history must not hinge on every file being
+    intact, so a damaged archive yields whatever it produced before the fault
+    and the walk moves on to the next one, with a note on stderr.
+    """
     for file_path in resolve_archive_files(archives_path):
-        with _open_archive(file_path) as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    yield line
+        try:
+            with _open_archive(file_path) as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        yield line
+        except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            print(f"Skipping unreadable archive {file_path}: {exc}", file=sys.stderr)
 
 
 def build_vectors(archives_path: str, max_events: Optional[int] = None) -> np.ndarray:

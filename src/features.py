@@ -1,23 +1,41 @@
 """Feature extraction: turn a sanitized Wazuh event into a fixed 64-D vector.
 
 The model only understands numbers, so every event must become a fixed-length
-numeric vector. This module builds that vector from:
+numeric vector. Schema v2 builds that vector from three groups:
 
-* **Continuous behavioural features** — command length, Shannon entropy (a proxy
-  for obfuscation / randomness in the command) and the number of system calls.
-* **Hashed categorical features** — high-cardinality strings such as the process
-  name or user are mapped into a small fixed array using the *hashing trick*,
-  which avoids maintaining an ever-growing vocabulary.
+* **Continuous behavioural features** — command shape (length, Shannon entropy,
+  token count, longest token, non-alphanumeric ratio), the time of day encoded
+  on a circle, and whether the session was attached to a terminal.
+* **Indicator flags** — booleans for the command patterns that characterise an
+  intrusion: piping a download into an interpreter, ``/dev/tcp`` sockets,
+  decoding a payload into a shell, stopping the security tooling, touching
+  credentials or persistence, escaping a container. An autoencoder trained on
+  benign traffic reconstructs these as zero, so a set flag produces a large,
+  targeted reconstruction error. Schema v1 had no such feature, which is why a
+  40-character ``curl … | bash`` scored an order of magnitude below a long but
+  harmless ``docker exec``.
+* **Hashed categorical features** — high-cardinality strings (process name,
+  acting user, target user, agent, working directory) mapped into a small fixed
+  array with the *hashing trick*, which avoids an ever-growing vocabulary.
 
 The output is always a ``float32`` array of length exactly ``INPUT_DIM`` (64),
 zero-padded deterministically when the assembled features are shorter.
+
+Changing the layout invalidates any previously trained model, because dimension
+*i* no longer means what the scaler and weights were fitted on. Every layout
+change must therefore bump ``FEATURE_SCHEMA_VERSION``; training records that
+number in the config and inference refuses to start on a mismatch.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
+import os
+import re
+import shlex
 from collections import Counter
+from datetime import datetime
 from typing import Any, Dict, List
 
 import numpy as np
@@ -25,28 +43,63 @@ import numpy as np
 INPUT_DIM: int = 64
 HASH_SIZE: int = 8
 
-# Continuous behavioural features, in vector order (dimensions 0..2).
+# Bump whenever the meaning or order of any dimension changes. Guards against
+# scoring events with a model trained on a different layout.
+FEATURE_SCHEMA_VERSION: int = 2
+
+# Continuous behavioural features, in vector order.
 CONTINUOUS_FEATURES: tuple[str, ...] = (
     "command_length",
     "command_entropy",
     "command_token_count",
+    "longest_token_length",
+    "non_alphanumeric_ratio",
+    "hour_sin",
+    "hour_cos",
+    "has_terminal",
+)
+
+# Value a set indicator flag takes in the vector. Flags are deliberately *not*
+# standardized (see ``training.train``), so this weight is what decides how much
+# one indicator is worth against the continuous features: a set flag contributes
+# INDICATOR_WEIGHT**2 to the squared error, the same as a 6-sigma deviation on a
+# continuous feature. Stating it as a constant is the point — z-scoring a binary
+# feature instead makes its weight 1/std, so a flag seen once in the training
+# sample would count 800x more than one never seen at all, which is backwards.
+INDICATOR_WEIGHT: float = 6.0
+
+# Indicator flags, in vector order. Each contributes a single dimension, 0.0 when
+# the pattern is absent and INDICATOR_WEIGHT when it matches.
+INDICATOR_FLAGS: tuple[str, ...] = (
+    "pipe_to_interpreter",
+    "remote_fetch",
+    "raw_socket_redirect",
+    "encoded_payload",
+    "interactive_shell_spawn",
+    "security_tooling_disabled",
+    "log_tampering",
+    "credential_access",
+    "persistence_config",
+    "privileged_account_config",
+    "container_escape",
+    "package_management",
 )
 
 # Categorical fields hashed into the vector. Each contributes HASH_SIZE elements.
 CATEGORICAL_FIELDS: tuple[str, ...] = (
     "process_name",
-    "parent_name",
-    "user",
-    "host_id",
+    "acting_user",
+    "target_user",
+    "agent_id",
+    "working_directory",
 )
 
 # Candidate keys to look up each logical field inside a Wazuh ``data`` block.
 # Wazuh's schema varies by decoder, so we try several common names.
 _FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
-    "process_name": ("process_name", "process", "exe", "comm"),
-    "parent_name": ("parent_name", " parent", "pcomm", "ppid"),
-    "user": ("user", "srcuser", "dstuser", "euid", "uid"),
-    "host_id": ("host_id", "hostname"),
+    "acting_user": ("srcuser", "user", "euid", "uid"),
+    "target_user": ("dstuser", "target_user"),
+    "working_directory": ("pwd", "cwd"),
 }
 
 # Fields whose presence marks an event as carrying the process/command
@@ -63,6 +116,69 @@ _TELEMETRY_FIELDS: tuple[str, ...] = (
     "comm",
 )
 
+# Regexes backing INDICATOR_FLAGS, in the same order. They are deliberately
+# narrow: a flag that fires on routine administration would be learnt as normal
+# and stop carrying signal. Where a lone token would be ambiguous (curl is
+# ordinary; curl piped into a shell is not) the discriminating context is part
+# of the pattern, or split across two flags the model can combine.
+_INTERPRETERS = r"(?:ba|z|k|da)?sh|python[0-9.]*|perl|ruby|node|php"
+_SECURITY_SERVICES = r"wazuh[\w-]*|suricata|fail2ban|auditd|falco|clamav|apparmor|selinux"
+
+_FLAG_PATTERNS: Dict[str, re.Pattern[str]] = {
+    "pipe_to_interpreter": re.compile(
+        rf"\|\s*(?:sudo\s+)?(?:/\S*/)?(?:{_INTERPRETERS})\b", re.IGNORECASE
+    ),
+    "remote_fetch": re.compile(
+        r"\b(?:curl|wget|fetch)\b.*?\b(?:https?|ftp)://|\b(?:curl|wget)\s+-", re.IGNORECASE
+    ),
+    "raw_socket_redirect": re.compile(r"/dev/(?:tcp|udp)/", re.IGNORECASE),
+    "encoded_payload": re.compile(
+        r"\bbase64\s+(?:-d|--decode)\b|\bxxd\s+-r\b|\bopenssl\s+enc\s+-d\b|"
+        r"\bbase64\.b64decode\b",
+        re.IGNORECASE,
+    ),
+    "interactive_shell_spawn": re.compile(
+        rf"\b(?:{_INTERPRETERS})\s+-i\b|\bnc\b[^|]*\s-\w*e\w*\s|\bsocat\b.*\bexec\b|"
+        r"\bpty\.spawn\b",
+        re.IGNORECASE,
+    ),
+    "security_tooling_disabled": re.compile(
+        rf"\b(?:systemctl|service)\s+(?:stop|disable|mask)\b.*(?:{_SECURITY_SERVICES})|"
+        rf"\b(?:pkill|killall)\b.*(?:{_SECURITY_SERVICES})",
+        re.IGNORECASE,
+    ),
+    "log_tampering": re.compile(
+        r"\b(?:rm|shred|truncate)\b[^|]*(?:/var/log|\.log)\b|"
+        r"\bjournalctl\s+--(?:vacuum|rotate)|>\s*/var/log/",
+        re.IGNORECASE,
+    ),
+    "credential_access": re.compile(
+        r"/etc/(?:shadow|gshadow)\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.ssh/id_|"
+        r"\.pgpass\b|\.aws/credentials\b|\.docker/config\.json\b",
+        re.IGNORECASE,
+    ),
+    "persistence_config": re.compile(
+        r"\bcrontab\b|/etc/cron|\bsystemctl\s+enable\b|/etc/systemd/system|"
+        r"/etc/rc\.local\b|\.bash(?:rc|_profile)\b",
+        re.IGNORECASE,
+    ),
+    "privileged_account_config": re.compile(
+        r"\b(?:useradd|adduser|userdel)\b|\busermod\b[^|]*-a?G\b|"
+        r"\bauthorized_keys\b|/etc/sudoers|\bvisudo\b",
+        re.IGNORECASE,
+    ),
+    "container_escape": re.compile(
+        r"\bdocker\s+run\b[^|]*(?:--privileged\b|--pid[= ]host\b|--net(?:work)?[= ]host\b|"
+        r"(?:-v|--volume)\s*/:)|\bnsenter\b",
+        re.IGNORECASE,
+    ),
+    "package_management": re.compile(
+        r"\b(?:apt|apt-get|yum|dnf|pacman|apk|zypper|snap)\b\s+"
+        r"(?:install|remove|purge|upgrade|update|-S)\b",
+        re.IGNORECASE,
+    ),
+}
+
 
 def has_process_telemetry(data: Dict[str, Any]) -> bool:
     """Return ``True`` if ``data`` carries usable process/command telemetry."""
@@ -74,18 +190,37 @@ def has_process_telemetry(data: Dict[str, Any]) -> bool:
     )
 
 
-def read_process_name(data: Dict[str, Any]) -> str:
-    """Best-effort human-readable process name from a Wazuh ``data`` block.
+def read_command(data: Dict[str, Any]) -> str:
+    """Return the command line carried by a Wazuh ``data`` block."""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("command") or data.get("args") or "")
 
-    Tries the same aliases the vectorizer uses; falls back to ``"unknown"`` when
-    none resolve (e.g. an event identified only by its command line).
+
+def read_process_name(data: Dict[str, Any]) -> str:
+    """Best-effort executable name for a Wazuh ``data`` block.
+
+    Prefers an explicit field when the decoder provides one. The Wazuh sudo
+    decoder does not, so it falls back to the basename of the command's first
+    token: ``/usr/bin/docker exec …`` becomes ``docker``. Schema v1 only tried
+    the explicit fields and therefore reported ``unknown`` on every event.
     """
-    if isinstance(data, dict):
-        for alias in _FIELD_ALIASES["process_name"]:
-            value = data.get(alias)
-            if value is not None and str(value).strip():
-                return str(value)
-    return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    for alias in ("process_name", "process", "exe", "comm"):
+        value = data.get(alias)
+        if value is not None and str(value).strip():
+            return os.path.basename(str(value).strip())
+
+    command = read_command(data).strip()
+    if not command:
+        return "unknown"
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # Unbalanced quotes in a raw log line: fall back to whitespace split.
+        tokens = command.split()
+    return os.path.basename(tokens[0]) if tokens else "unknown"
 
 
 def read_user(data: Dict[str, Any]) -> str:
@@ -95,11 +230,39 @@ def read_user(data: Dict[str, Any]) -> str:
     events); returns ``""`` when none resolve.
     """
     if isinstance(data, dict):
-        for alias in _FIELD_ALIASES["user"]:
+        for alias in _FIELD_ALIASES["acting_user"]:
             value = data.get(alias)
             if value is not None and str(value).strip():
                 return str(value)
     return ""
+
+
+def read_agent_id(event: Dict[str, Any]) -> str:
+    """Return the agent id from the event envelope.
+
+    The agent lives at the top level of a Wazuh alert, not inside ``data``.
+    Schema v1 looked for it in ``data`` only, so every event hashed to the same
+    empty value and the model could not tell one host from another.
+    """
+    agent = event.get("agent") if isinstance(event, dict) else None
+    if isinstance(agent, dict):
+        for key in ("id", "name"):
+            value = agent.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _hour_of_day(event: Dict[str, Any]) -> "float | None":
+    """Return the hour (0-24, fractional) of the event, or None if unavailable."""
+    raw = str(event.get("timestamp", "")).strip() if isinstance(event, dict) else ""
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment.hour + moment.minute / 60.0
 
 
 class LogVectorizer:
@@ -127,11 +290,14 @@ class LogVectorizer:
         The string ``f"{category}_{value}"`` is hashed deterministically (MD5, so
         results are stable across processes unlike Python's salted ``hash``). The
         hash modulo ``HASH_SIZE`` selects the bucket; a separate bit of the hash
-        picks the sign, which helps cancel out collisions on average.
+        picks the sign, which helps cancel out collisions on average. MD5 is a
+        bucket assignment here, never a security decision.
         """
         bucket = [0.0] * HASH_SIZE
         token = f"{category}_{value}".encode("utf-8")
-        digest = int.from_bytes(hashlib.md5(token).digest(), "big")
+        digest = int.from_bytes(
+            hashlib.md5(token, usedforsecurity=False).digest(), "big"
+        )
         index = digest % HASH_SIZE
         sign = 1.0 if (digest // HASH_SIZE) % 2 == 0 else -1.0
         bucket[index] += sign
@@ -144,40 +310,71 @@ class LogVectorizer:
                 return str(data[alias])
         return ""
 
-    def _count_command_tokens(self, command: str) -> float:
-        """Return the number of whitespace-separated tokens in ``command``.
+    def _command_shape(self, command: str) -> List[float]:
+        """Return the continuous descriptors of the command string itself."""
+        tokens = command.split()
+        longest = float(max((len(token) for token in tokens), default=0))
+        non_alphanumeric = sum(1 for char in command if not char.isalnum())
+        ratio = non_alphanumeric / len(command) if command else 0.0
+        return [
+            float(len(command)),
+            self.calculate_shannon_entropy(command),
+            float(len(tokens)),
+            longest,
+            ratio,
+        ]
 
-        A coarse proxy for how much a command is doing: pipelines and long
-        argument lists score higher than a bare invocation. It is deliberately
-        only that — an earlier revision also honoured a ``syscall_count`` field
-        when one happened to be present, which would have made a single vector
-        dimension mean two incomparable quantities depending on the decoder, and
-        broken the scaler fitted at training time.
+    def _time_of_day(self, event: Dict[str, Any]) -> List[float]:
+        """Encode the hour on a circle so 23:00 and 00:00 sit next to each other.
+
+        Both components are zero when the event carries no usable timestamp,
+        which is a state distinct from any real hour. Training and inference
+        share this code, so the model sees that state consistently.
         """
-        return float(len(command.split()))
+        hour = _hour_of_day(event)
+        if hour is None:
+            return [0.0, 0.0]
+        angle = 2.0 * math.pi * hour / 24.0
+        return [math.sin(angle), math.cos(angle)]
+
+    def _indicator_flags(self, command: str) -> List[float]:
+        """Return one dimension per entry of ``INDICATOR_FLAGS``.
+
+        A matching pattern yields ``INDICATOR_WEIGHT`` rather than 1.0 so the
+        indicator carries its intended weight without being standardized.
+        """
+        return [
+            INDICATOR_WEIGHT if _FLAG_PATTERNS[name].search(command) else 0.0
+            for name in INDICATOR_FLAGS
+        ]
 
     def extract_vector(self, event: Dict[str, Any]) -> np.ndarray:
         """Build the fixed-length 64-D ``float32`` feature vector for an event.
 
-        Layout: 3 continuous features, then ``HASH_SIZE`` values per categorical
-        field, then deterministic zero padding up to ``INPUT_DIM``.
+        Layout: the continuous features, then one dimension per indicator flag,
+        then ``HASH_SIZE`` values per categorical field, then deterministic zero
+        padding up to ``INPUT_DIM``.
         """
-        data = event.get("data", {})
+        data = event.get("data", {}) if isinstance(event, dict) else {}
         if not isinstance(data, dict):
             data = {}
 
-        command = str(data.get("command") or data.get("args") or "")
+        command = read_command(data)
 
-        continuous: List[float] = [
-            float(len(command)),
-            self.calculate_shannon_entropy(command),
-            self._count_command_tokens(command),
-        ]
+        vector: List[float] = self._command_shape(command)
+        vector.extend(self._time_of_day(event))
+        vector.append(1.0 if str(data.get("tty") or "").strip() else 0.0)
+        vector.extend(self._indicator_flags(command))
 
-        vector: List[float] = list(continuous)
+        categorical_values = {
+            "process_name": read_process_name(data),
+            "acting_user": self._read_field(data, "acting_user"),
+            "target_user": self._read_field(data, "target_user"),
+            "agent_id": read_agent_id(event),
+            "working_directory": self._read_field(data, "working_directory"),
+        }
         for field in CATEGORICAL_FIELDS:
-            value = self._read_field(data, field)
-            vector.extend(self.apply_feature_hashing(field, value))
+            vector.extend(self.apply_feature_hashing(field, categorical_values[field]))
 
         # Deterministic zero-padding (and a safety truncation) to exactly INPUT_DIM.
         if len(vector) < INPUT_DIM:
@@ -189,8 +386,8 @@ class LogVectorizer:
 
 # Logical feature -> direction-aware human-readable templates. Continuous
 # features have a meaningful direction (the standardized value's sign says
-# whether the observed value is above or below the benign mean); hashed
-# categorical features do not, so they get a single template.
+# whether the observed value is above or below the benign mean); indicator flags
+# and hashed categorical features do not, so they get a single template.
 _FEATURE_DESCRIPTIONS: Dict[str, tuple[str, ...]] = {
     "command_length": ("command length above normal", "command length below normal"),
     "command_entropy": ("command entropy above normal", "command entropy below normal"),
@@ -198,34 +395,51 @@ _FEATURE_DESCRIPTIONS: Dict[str, tuple[str, ...]] = {
         "command token count above normal",
         "command token count below normal",
     ),
+    "longest_token_length": (
+        "unusually long single argument",
+        "unusually short arguments",
+    ),
+    "non_alphanumeric_ratio": (
+        "unusual proportion of punctuation and operators",
+        "unusually plain command text",
+    ),
+    "hour_sin": ("unusual time of day", "unusual time of day"),
+    "hour_cos": ("unusual time of day", "unusual time of day"),
+    "has_terminal": (
+        "interactive terminal where automation is expected",
+        "no terminal where an interactive session is expected",
+    ),
+    "pipe_to_interpreter": ("output piped into a shell or interpreter",),
+    "remote_fetch": ("downloads content from a remote host",),
+    "raw_socket_redirect": ("opens a raw network socket via /dev/tcp",),
+    "encoded_payload": ("decodes an encoded payload",),
+    "interactive_shell_spawn": ("spawns an interactive or remote shell",),
+    "security_tooling_disabled": ("stops or disables security tooling",),
+    "log_tampering": ("removes or truncates logs",),
+    "credential_access": ("reads credential material",),
+    "persistence_config": ("touches a persistence mechanism",),
+    "privileged_account_config": ("touches privileged account configuration",),
+    "container_escape": ("runs a container with host-level access",),
+    "package_management": ("installs or removes system packages",),
     "process_name": ("process name pattern unusual",),
-    "parent_name": ("parent process pattern unusual",),
-    "user": ("user pattern unusual",),
-    "host_id": ("host pattern unusual",),
+    "acting_user": ("acting user pattern unusual",),
+    "target_user": ("target user pattern unusual",),
+    "agent_id": ("host pattern unusual",),
+    "working_directory": ("working directory pattern unusual",),
 }
-
-# Categorical fields that the Wazuh sudo decoder — the only source of process
-# telemetry on this deployment — never populates. They hash to the same empty
-# value on every event, so their reconstruction error is a constant offset that
-# says nothing about the event being scored. Reporting them as "unusual" put a
-# meaningless cause at the top of nearly every alert, and fed it to the triage
-# LLM as if it were evidence, so ``explain_anomaly`` leaves them out.
-UNINFORMATIVE_FEATURES: frozenset[str] = frozenset(
-    {"process_name", "parent_name", "host_id"}
-)
 
 
 def feature_layout() -> List[tuple[str, int, int]]:
     """Return ``(logical_name, start, end)`` spans over the feature vector.
 
-    Each continuous feature occupies a single dimension; each categorical field
-    occupies ``HASH_SIZE`` contiguous dimensions. The trailing deterministic
-    zero-padding is intentionally omitted: those dimensions always reconstruct
-    to ~0 error and carry no behavioural meaning.
+    Continuous features and indicator flags occupy a single dimension each; a
+    categorical field occupies ``HASH_SIZE`` contiguous dimensions. The trailing
+    deterministic zero-padding is intentionally omitted: those dimensions always
+    reconstruct to ~0 error and carry no behavioural meaning.
     """
     layout: List[tuple[str, int, int]] = []
     index = 0
-    for name in CONTINUOUS_FEATURES:
+    for name in CONTINUOUS_FEATURES + INDICATOR_FLAGS:
         layout.append((name, index, index + 1))
         index += 1
     for field in CATEGORICAL_FIELDS:
@@ -248,11 +462,6 @@ def explain_anomaly(
     it is high", which both a human analyst and a downstream LLM triage layer
     can act on.
 
-    Features listed in ``UNINFORMATIVE_FEATURES`` are skipped: they are constant
-    on this telemetry, so their error is a fixed offset rather than a property of
-    the event. Percentages stay relative to the *total* error, so a reported
-    share is still that feature's true weight in the score.
-
     ``normalized`` is the standardized feature vector (its sign gives the
     direction for continuous features); ``per_dim_error`` is ``(x - x̂)²`` per
     dimension.
@@ -260,8 +469,6 @@ def explain_anomaly(
     total = float(per_dim_error.sum())
     contributions: List[Dict[str, Any]] = []
     for name, start, end in feature_layout():
-        if name in UNINFORMATIVE_FEATURES:
-            continue
         error = float(per_dim_error[start:end].sum())
         if error <= 0.0:
             continue
