@@ -20,8 +20,10 @@ import torch
 
 from src.config import load_config
 from src.features import (
+    FEATURE_SCHEMA_VERSION,
     LogVectorizer,
     explain_anomaly,
+    read_command,
     read_process_name,
     read_user,
     standardize,
@@ -74,8 +76,38 @@ def _should_alert(
     return True
 
 
+class FeatureSchemaMismatch(RuntimeError):
+    """Raised when the trained model was fitted on a different feature layout."""
+
+
+def ensure_schema_compatibility(config: Dict[str, Any]) -> None:
+    """Abort unless the stored weights were trained on the current layout.
+
+    The scaler and the weights are only meaningful for the exact dimension
+    ordering they were fitted on. Scoring events with a mismatched layout does
+    not fail loudly — it silently produces meaningless reconstruction errors, so
+    the detector would keep publishing alerts that mean nothing. Refusing to
+    start is the safe outcome: the previous model and threshold stay on disk and
+    a retrain restores service.
+    """
+    trained_version = config.get("feature_schema_version")
+    if trained_version is None:
+        raise FeatureSchemaMismatch(
+            "config has no feature_schema_version, so the stored weights predate "
+            f"schema v{FEATURE_SCHEMA_VERSION}. Retrain and recalibrate before "
+            "running this build."
+        )
+    if int(trained_version) != FEATURE_SCHEMA_VERSION:
+        raise FeatureSchemaMismatch(
+            f"model was trained on feature schema v{int(trained_version)} but this "
+            f"build produces v{FEATURE_SCHEMA_VERSION} vectors. Retrain and "
+            "recalibrate before running this build."
+        )
+
+
 def load_inference_model(config: Dict[str, Any]) -> LogAutoencoder:
     """Instantiate the autoencoder, load trained weights, and set eval mode."""
+    ensure_schema_compatibility(config)
     model = LogAutoencoder(
         input_dim=int(config["input_dim"]),
         latent_dim=int(config["latent_dim"]),
@@ -159,7 +191,7 @@ def process_line(
         agent_name = str(agent.get("name", ""))
         process_name = read_process_name(data)
         user = read_user(data)
-        command = str(data.get("command") or data.get("args") or "")
+        command = read_command(data)
         timestamp = str(event.get("timestamp", ""))
 
         # Dedup on the command itself (fall back to the score when there is no
@@ -208,7 +240,15 @@ def run_realtime_inference(config_path: str = "config/global_config.json") -> No
     sanitizer = ISOSanitizer()
     vectorizer = LogVectorizer()
     injector = WazuhSocketInjector(config["wazuh_socket_path"])
-    model = load_inference_model(config)
+    try:
+        model = load_inference_model(config)
+    except FeatureSchemaMismatch as exc:
+        # Expected while a new build is deployed but its model has not been
+        # promoted yet. Report it as one readable line instead of a traceback
+        # repeated on every restart, and stop: the previous model and threshold
+        # are still on disk, so promoting them restores service.
+        logger.error("Refusing to score events: %s", exc)
+        raise SystemExit(1) from None
 
     tau = float(config["anomaly_threshold_tau"])
     scaler_mean = config["scaler_mean"]

