@@ -23,6 +23,10 @@ def test_output_layer_is_unbounded() -> None:
     # The spec requires a pure linear output (no Sigmoid/Tanh) so reconstructions
     # can span the real range of the scaled features. Check the architecture has
     # no bounding activation, and that outputs can actually exceed [-1, 1].
+    # Seed before building the model: the weights are random too, and seeding
+    # only the input left roughly one run in eight drawing a network whose
+    # output happened to stay inside [-1, 1].
+    torch.manual_seed(0)
     model = LogAutoencoder()
     assert isinstance(list(model.decoder.children())[-1], torch.nn.Linear)
     assert not any(
@@ -30,6 +34,5 @@ def test_output_layer_is_unbounded() -> None:
     )
 
     # Drive the net with large inputs; a bounded head could never produce these.
-    torch.manual_seed(0)
     output = model(torch.randn(256, 64) * 50)
     assert output.abs().max().item() > 1.0
