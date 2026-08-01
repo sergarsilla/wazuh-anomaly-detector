@@ -9,7 +9,7 @@ into the Wazuh dashboard.
 <p>
   <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-CPU-ee4c2c">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-48%20passing-3fb950">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-64%20passing-3fb950">
   <img alt="Docker" src="https://img.shields.io/badge/docker-ready-2496ed">
 </p>
 
@@ -121,11 +121,12 @@ wazuh-anomaly-detector/
 │   └── run_training.py         # One-shot: export → train → evaluate
 ├── scripts/
 │   ├── calibrate_threshold.py  # Compare τ candidates + false-positive rates (advisory)
+│   ├── validate_detection.py   # Acceptance check: does the model catch attacks?
 │   └── profile_archives.py     # Profile archives.json: event/decoder/field coverage
 ├── rules/
 │   └── local_rules.xml         # Custom Wazuh rule (id 100100)
 ├── models/                     # Trained model.pt lands here (generated)
-├── tests/                      # 48 pytest cases
+├── tests/                      # 64 pytest cases
 ├── .github/workflows/ci.yml    # CI: install CPU torch + run pytest
 ├── Dockerfile
 └── docker-compose.yml
@@ -162,6 +163,10 @@ sudo du -sh /var/ossec/logs/archives
 sudo docker compose run --rm --build trainer
 # e.g. cap to 1M events:  sudo docker compose run --rm -e MAX_EVENTS=1000000 trainer
 
+# 3b. Check the model catches attacks, not just that it is quiet on normal
+#     traffic. Calibration bounds false positives and says nothing about recall.
+sudo docker compose run --rm trainer python scripts/validate_detection.py
+
 # 4. Install the Wazuh rule and restart the manager (one-off)
 sudo bash -c 'cat rules/local_rules.xml >> /var/ossec/etc/rules/local_rules.xml'
 sudo systemctl restart wazuh-manager
@@ -173,6 +178,31 @@ sudo docker compose up -d detector
 > 💡 Wazuh only writes to `archives.json` when `<logall_json>yes</logall_json>` is set
 > in `/var/ossec/etc/ossec.conf` (then restart the manager). This logs **every** event,
 > so watch disk usage (`df -h`) and consider enabling it only during capture windows.
+
+### Changing the features requires a retrain
+
+The scaler and the trained weights are only meaningful for the exact dimension
+ordering they were fitted on. Change what a dimension means and the model does
+not fail loudly — it scores every event meaninglessly while still publishing
+alerts.
+
+`FEATURE_SCHEMA_VERSION` in `src/features.py` guards against that. Training
+writes it into the config alongside the scaler, and the detector refuses to
+start when it does not match the layout the running build produces:
+
+```
+Refusing to score events: model was trained on feature schema v1 but this
+build produces v2 vectors. Retrain and recalibrate before running this build.
+```
+
+That is the intended outcome, not a bug: the previous model and threshold stay
+on disk, so nothing is lost. Retrain (step 3), re-run the acceptance check
+(step 3b), and the detector starts again.
+
+Because the deploy path excludes `models/`, `data/` and `config/global_config.json`,
+shipping a schema change through CI lands the code without its model. Promote the
+retrained `model.pt` and the new `feature_schema_version` / `scaler_*` /
+`anomaly_threshold_tau` values together with it.
 
 ---
 
