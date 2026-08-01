@@ -109,3 +109,27 @@ def test_iter_archive_lines_reads_through_gzip_and_skips_blanks(tmp_path: Path) 
     assert '{"x":1}' in lines
     assert '{"y":2}' in lines
     assert "" not in lines
+
+
+def test_truncated_archive_does_not_abort_the_walk(tmp_path) -> None:
+    """A damaged rotated archive must cost its own lines, not the whole history."""
+    import gzip as gzip_module
+
+    good = tmp_path / "ossec-archive-01.json.gz"
+    with gzip_module.open(good, "wt", encoding="utf-8") as handle:
+        handle.write('{"data": {"command": "ls -la"}}\n')
+
+    # Chop the gzip trailer so decompression raises partway through.
+    truncated = tmp_path / "ossec-archive-02.json.gz"
+    with gzip_module.open(truncated, "wt", encoding="utf-8") as handle:
+        handle.write('{"data": {"command": "docker ps"}}\n' * 200)
+    truncated.write_bytes(truncated.read_bytes()[:-64])
+
+    later = tmp_path / "ossec-archive-03.json.gz"
+    with gzip_module.open(later, "wt", encoding="utf-8") as handle:
+        handle.write('{"data": {"command": "systemctl status"}}\n')
+
+    lines = list(iter_archive_lines(str(tmp_path)))
+
+    assert any("ls -la" in line for line in lines)
+    assert any("systemctl status" in line for line in lines)

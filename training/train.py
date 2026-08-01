@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import load_config, update_config  # noqa: E402
+from src.features import CONTINUOUS_FEATURES, FEATURE_SCHEMA_VERSION  # noqa: E402
 from src.model import LogAutoencoder  # noqa: E402
 
 
@@ -46,7 +47,22 @@ def train_model(config_path: str, dataset_path: str) -> float:
     # Fit the scaler on normal data; its mean/var define the normalization used
     # everywhere downstream.
     scaler = StandardScaler()
-    normalized = scaler.fit_transform(dataset).astype(np.float32)
+    scaler.fit(dataset)
+
+    # Standardize the continuous features only. Indicator flags are binary and
+    # the hashed categoricals are already +/-1, so z-scoring them would set each
+    # dimension's weight to 1/std - an artefact of how often a pattern happened
+    # to appear in the sample, not a property of the behaviour. It also inverts
+    # the signal: a flag never seen in benign traffic has zero variance, and the
+    # divide-by-zero guard would then give it the *smallest* weight of all.
+    # Neutralising those entries leaves them on their intended scale, and keeps
+    # the config format unchanged for inference.
+    passthrough = slice(len(CONTINUOUS_FEATURES), None)
+    scaler.mean_[passthrough] = 0.0
+    scaler.var_[passthrough] = 1.0
+    scaler.scale_[passthrough] = 1.0
+
+    normalized = scaler.transform(dataset).astype(np.float32)
 
     tensor_data = torch.from_numpy(normalized)
     # The autoencoder reconstructs its own input, so inputs and targets match.
@@ -81,9 +97,13 @@ def train_model(config_path: str, dataset_path: str) -> float:
     # Persist weights and the scaler parameters into the config.
     os.makedirs(os.path.dirname(config["model_save_path"]) or ".", exist_ok=True)
     torch.save(model.state_dict(), config["model_save_path"])
+    # The schema version travels with the scaler: together they describe the
+    # layout these weights were fitted on, and inference refuses to start unless
+    # it matches the layout the running build produces.
     update_config(
         config_path,
         {
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
             "scaler_mean": scaler.mean_.tolist(),
             "scaler_var": scaler.var_.tolist(),
         },
