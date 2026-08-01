@@ -29,7 +29,7 @@ HASH_SIZE: int = 8
 CONTINUOUS_FEATURES: tuple[str, ...] = (
     "command_length",
     "command_entropy",
-    "syscall_count",
+    "command_token_count",
 )
 
 # Categorical fields hashed into the vector. Each contributes HASH_SIZE elements.
@@ -144,18 +144,16 @@ class LogVectorizer:
                 return str(data[alias])
         return ""
 
-    def _count_syscalls(self, data: Dict[str, Any], command: str) -> float:
-        """Best-effort count of system calls in the event.
+    def _count_command_tokens(self, command: str) -> float:
+        """Return the number of whitespace-separated tokens in ``command``.
 
-        Uses an explicit count/list field when present, otherwise falls back to
-        the number of whitespace-separated tokens in the command.
+        A coarse proxy for how much a command is doing: pipelines and long
+        argument lists score higher than a bare invocation. It is deliberately
+        only that — an earlier revision also honoured a ``syscall_count`` field
+        when one happened to be present, which would have made a single vector
+        dimension mean two incomparable quantities depending on the decoder, and
+        broken the scaler fitted at training time.
         """
-        for key in ("syscall_count", "syscalls", "syscall"):
-            value = data.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
-            if isinstance(value, list):
-                return float(len(value))
         return float(len(command.split()))
 
     def extract_vector(self, event: Dict[str, Any]) -> np.ndarray:
@@ -173,7 +171,7 @@ class LogVectorizer:
         continuous: List[float] = [
             float(len(command)),
             self.calculate_shannon_entropy(command),
-            self._count_syscalls(data, command),
+            self._count_command_tokens(command),
         ]
 
         vector: List[float] = list(continuous)
@@ -196,12 +194,25 @@ class LogVectorizer:
 _FEATURE_DESCRIPTIONS: Dict[str, tuple[str, ...]] = {
     "command_length": ("command length above normal", "command length below normal"),
     "command_entropy": ("command entropy above normal", "command entropy below normal"),
-    "syscall_count": ("system-call count above normal", "system-call count below normal"),
+    "command_token_count": (
+        "command token count above normal",
+        "command token count below normal",
+    ),
     "process_name": ("process name pattern unusual",),
     "parent_name": ("parent process pattern unusual",),
     "user": ("user pattern unusual",),
     "host_id": ("host pattern unusual",),
 }
+
+# Categorical fields that the Wazuh sudo decoder — the only source of process
+# telemetry on this deployment — never populates. They hash to the same empty
+# value on every event, so their reconstruction error is a constant offset that
+# says nothing about the event being scored. Reporting them as "unusual" put a
+# meaningless cause at the top of nearly every alert, and fed it to the triage
+# LLM as if it were evidence, so ``explain_anomaly`` leaves them out.
+UNINFORMATIVE_FEATURES: frozenset[str] = frozenset(
+    {"process_name", "parent_name", "host_id"}
+)
 
 
 def feature_layout() -> List[tuple[str, int, int]]:
@@ -237,6 +248,11 @@ def explain_anomaly(
     it is high", which both a human analyst and a downstream LLM triage layer
     can act on.
 
+    Features listed in ``UNINFORMATIVE_FEATURES`` are skipped: they are constant
+    on this telemetry, so their error is a fixed offset rather than a property of
+    the event. Percentages stay relative to the *total* error, so a reported
+    share is still that feature's true weight in the score.
+
     ``normalized`` is the standardized feature vector (its sign gives the
     direction for continuous features); ``per_dim_error`` is ``(x - x̂)²`` per
     dimension.
@@ -244,6 +260,8 @@ def explain_anomaly(
     total = float(per_dim_error.sum())
     contributions: List[Dict[str, Any]] = []
     for name, start, end in feature_layout():
+        if name in UNINFORMATIVE_FEATURES:
+            continue
         error = float(per_dim_error[start:end].sum())
         if error <= 0.0:
             continue

@@ -7,6 +7,7 @@ from src.features import (
     CONTINUOUS_FEATURES,
     HASH_SIZE,
     INPUT_DIM,
+    UNINFORMATIVE_FEATURES,
     LogVectorizer,
     explain_anomaly,
     feature_layout,
@@ -56,6 +57,21 @@ def test_extract_vector_shape_and_dtype() -> None:
     assert vector.shape == (INPUT_DIM,)
 
 
+def test_token_count_dimension_counts_command_tokens() -> None:
+    """Dimension 2 is the token count of the command, and nothing else.
+
+    A ``syscall_count`` field in the event must not be picked up: the dimension
+    would then mean two different quantities depending on the decoder, which the
+    scaler fitted at training time cannot represent.
+    """
+    vectorizer = LogVectorizer()
+    command = "/usr/bin/docker ps -a --format table"
+    vector = vectorizer.extract_vector(
+        {"data": {"command": command, "syscall_count": 4096}}
+    )
+    assert vector[2] == float(len(command.split()))
+
+
 def test_extract_vector_handles_missing_data() -> None:
     vectorizer = LogVectorizer()
     vector = vectorizer.extract_vector({"data": {}})
@@ -83,16 +99,47 @@ def test_explain_anomaly_ranks_top_contributors() -> None:
     # command_entropy (index 1) dominates, observed above the benign mean.
     per_dim[1] = 9.0
     normalized[1] = 2.5
-    # process_name hash bucket (index 3) is a weaker contributor.
-    per_dim[3] = 1.0
+    # The "user" hash block (starts at index 19) is a weaker contributor.
+    per_dim[19] = 1.0
 
     top = explain_anomaly(normalized, per_dim, top_k=3)
 
     assert top[0]["feature"] == "command_entropy"
     assert top[0]["message"] == "command entropy above normal"
     assert top[0]["contribution_pct"] == 90.0
-    assert top[1]["feature"] == "process_name"
-    assert top[1]["message"] == "process name pattern unusual"
+    assert top[1]["feature"] == "user"
+    assert top[1]["message"] == "user pattern unusual"
+
+
+def test_explain_anomaly_reports_token_count_as_such() -> None:
+    """The third continuous feature counts command tokens, and says so."""
+    per_dim = np.zeros(INPUT_DIM, dtype=np.float32)
+    normalized = np.zeros(INPUT_DIM, dtype=np.float32)
+    per_dim[2] = 5.0
+    normalized[2] = 1.2
+
+    top = explain_anomaly(normalized, per_dim, top_k=1)
+
+    assert top[0]["feature"] == "command_token_count"
+    assert top[0]["message"] == "command token count above normal"
+
+
+def test_explain_anomaly_omits_constant_features() -> None:
+    """Fields absent from this telemetry must never be reported as a cause."""
+    per_dim = np.zeros(INPUT_DIM, dtype=np.float32)
+    normalized = np.zeros(INPUT_DIM, dtype=np.float32)
+    # process_name (3..10), parent_name (11..18) and host_id (27..34) all carry
+    # error, but none of them varies with the event being scored.
+    per_dim[3] = 8.0
+    per_dim[11] = 6.0
+    per_dim[27] = 4.0
+    # Only the acting user genuinely varies.
+    per_dim[19] = 1.0
+
+    top = explain_anomaly(normalized, per_dim, top_k=3)
+
+    assert [item["feature"] for item in top] == ["user"]
+    assert UNINFORMATIVE_FEATURES == {"process_name", "parent_name", "host_id"}
 
 
 def test_explain_anomaly_direction_below_normal() -> None:
