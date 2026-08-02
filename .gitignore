@@ -226,3 +226,5 @@ deploy.sh
 # Live config holds trained artifacts (scaler_mean/var, tau) written by training.
 # Keep it out of git; copy config/global_config.example.json to create it.
 config/global_config.json
+# Per-deployment validation corpus (real commands stay out of the repo).
+config/validation_corpus.local.json

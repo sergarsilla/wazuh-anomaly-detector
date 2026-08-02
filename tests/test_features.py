@@ -99,8 +99,8 @@ def test_process_name_survives_unbalanced_quotes() -> None:
 
 def test_agent_id_comes_from_the_event_envelope() -> None:
     """The agent lives beside ``data``, not inside it, so hosts are separable."""
-    assert read_agent_id({"agent": {"id": "017", "name": "host-02"}}) == "017"
-    assert read_agent_id({"agent": {"name": "host-02"}}) == "host-02"
+    assert read_agent_id({"agent": {"id": "001", "name": "host-01"}}) == "001"
+    assert read_agent_id({"agent": {"name": "host-01"}}) == "host-01"
     assert read_agent_id({"data": {"command": "ls"}}) == ""
 
 
