@@ -37,11 +37,15 @@ class ISOSanitizer:
         self._jwt_pattern = re.compile(
             r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
         )
-        # Explicit credentials passed as system parameters, e.g. ``--password=foo``
-        # or ``token: abc123``. Only the value is masked; the key name is kept.
+        # Explicit credentials passed as system parameters, e.g. ``--password=foo``,
+        # ``token: abc123`` or ``PGPASSWORD=foo``. Only the value is masked; the
+        # key name is kept. The leading ``[A-Za-z0-9_]*`` is what catches the
+        # prefixed environment-variable form (``NTFY_PASSWORD=``, ``DB_TOKEN=``):
+        # ``\bpassword`` never matches there, because ``_`` and letters are word
+        # characters and so no word boundary exists before the keyword.
         self._credential_pattern = re.compile(
-            r"(?i)\b(password|passwd|pwd|secret|token|api[-_]?key|apikey|"
-            r"access[-_]?key|auth)\b\s*[:=]\s*[^\s\"',;]+"
+            r"(?i)\b([A-Za-z0-9_]*(?:password|passwd|pwd|secret|token|"
+            r"api[-_]?key|apikey|access[-_]?key|auth))\s*[:=]\s*[^\s\"',;]+"
         )
         # Standard email addresses.
         self._email_pattern = re.compile(

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from src.sanitizer import (
     MASKED_CREDENTIAL,
     MASKED_EMAIL,
@@ -39,6 +41,39 @@ def test_masks_credential_parameter() -> None:
     result = sanitizer.sanitize_string("mysql -u root --password=SuperSecret123")
     assert "SuperSecret123" not in result
     assert MASKED_CREDENTIAL in result
+
+
+@pytest.mark.parametrize(
+    "command, secret",
+    [
+        ("docker exec -e NTFY_PASSWORD=PBijDkP0Znn ntfy ntfy user add gatus", "PBijDkP0Znn"),
+        ("PGPASSWORD=s3cretValue psql -c 'select 1'", "s3cretValue"),
+        ("export DB_TOKEN=abc123def", "abc123def"),
+        ("export MY_API_KEY=zzz999", "zzz999"),
+    ],
+)
+def test_masks_prefixed_credential_env_vars(command: str, secret: str) -> None:
+    """A keyword preceded by a variable prefix still has its value masked.
+
+    ``\\bpassword`` never matches inside ``NTFY_PASSWORD``: ``_`` and letters are
+    word characters, so there is no word boundary before the keyword.
+    """
+    result = ISOSanitizer().sanitize_string(command)
+    assert secret not in result
+    assert MASKED_CREDENTIAL in result
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "grep -r password /etc/",
+        "ansible-playbook --vault-password-file /etc/vault",
+        "cat /root/.ssh/authorized_keys",
+    ],
+)
+def test_leaves_credential_keywords_without_a_value_untouched(command: str) -> None:
+    """The keyword alone is not a secret; only an assigned value is masked."""
+    assert ISOSanitizer().sanitize_string(command) == command
 
 
 def test_masks_private_key_block() -> None:
