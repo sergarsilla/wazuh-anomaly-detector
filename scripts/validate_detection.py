@@ -20,6 +20,18 @@ either or both keys:
 
     {"benign": ["...", "..."], "malicious": ["...", "..."]}
 
+**Set ``identity`` too.** Each command is scored inside a synthetic sudo event,
+and the vectorizer hashes that event's agent, acting user and working directory
+into 24 of its 64 dimensions. Values the model never saw during training make
+those dimensions reconstruct badly, adding a constant error to *every* command
+in the corpus — on a real deployment that offset has been measured at the same
+order of magnitude as tau itself, which fails the benign half no matter how
+good the model is. Name a host and an account that actually exist in your
+estate:
+
+    {"identity": {"agent_id": "000", "agent_name": "manager",
+                  "srcuser": "admin", "dstuser": "root", "pwd": "/home/admin"}}
+
 Run it after every retrain, before promoting a model.
 
 Usage:
@@ -31,7 +43,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
@@ -44,6 +56,18 @@ from src.model import LogAutoencoder  # noqa: E402
 # Optional per-deployment corpus. Keep real commands here, out of version
 # control, rather than in the defaults below.
 LOCAL_CORPUS_PATH: str = "config/validation_corpus.local.json"
+
+# Identity the synthetic scoring event carries. These are placeholders: the
+# vectorizer hashes agent, acting user and working directory into 24 of the 64
+# dimensions, so values absent from the training data reconstruct badly and add
+# a constant error to every score. Override via "identity" in the local corpus.
+DEFAULT_IDENTITY: Dict[str, str] = {
+    "agent_id": "001",
+    "agent_name": "host-01",
+    "srcuser": "admin",
+    "dstuser": "root",
+    "pwd": "/home/admin",
+}
 
 # Generic routine administration. None of these should raise an alert, however
 # long or unfamiliar the command looks. Substitute your own.
@@ -78,22 +102,35 @@ DEFAULT_MALICIOUS_COMMANDS: Tuple[str, ...] = (
 )
 
 
-def load_corpora() -> Tuple[Sequence[str], Sequence[str]]:
-    """Return ``(benign, malicious)``, preferring the local corpus when present."""
+def load_corpora() -> Tuple[Sequence[str], Sequence[str], Dict[str, str]]:
+    """Return ``(benign, malicious, identity)``, preferring the local corpus."""
     benign: Sequence[str] = DEFAULT_BENIGN_COMMANDS
     malicious: Sequence[str] = DEFAULT_MALICIOUS_COMMANDS
+    identity: Dict[str, str] = dict(DEFAULT_IDENTITY)
     if os.path.exists(LOCAL_CORPUS_PATH):
         with open(LOCAL_CORPUS_PATH, encoding="utf-8") as handle:
             local = json.load(handle)
         benign = local.get("benign") or benign
         malicious = local.get("malicious") or malicious
+        identity.update(
+            {k: str(v) for k, v in (local.get("identity") or {}).items() if k in DEFAULT_IDENTITY}
+        )
         print(f"Using corpus overrides from {LOCAL_CORPUS_PATH}")
     else:
         print(
             f"No {LOCAL_CORPUS_PATH}; using the generic defaults. Supply your own "
             "benign commands to make this check meaningful."
         )
-    return benign, malicious
+    if identity == DEFAULT_IDENTITY:
+        print(
+            "Scoring with the placeholder identity "
+            f"(agent {DEFAULT_IDENTITY['agent_id']}, user {DEFAULT_IDENTITY['srcuser']}, "
+            f"pwd {DEFAULT_IDENTITY['pwd']}). If none of these exist in the training "
+            "data, every score carries a constant offset and the benign half may fail "
+            "on a healthy model. Set \"identity\" in the local corpus to a real host "
+            "and account."
+        )
+    return benign, malicious, identity
 
 
 def _score(
@@ -102,16 +139,17 @@ def _score(
     command: str,
     scaler_mean: List[float],
     scaler_var: List[float],
+    identity: Dict[str, str],
 ) -> float:
     """Return the reconstruction MSE for ``command`` as a sudo-shaped event."""
     event = {
         "timestamp": "2026-01-01T11:00:00.000+0000",
-        "agent": {"id": "001", "name": "host-01"},
+        "agent": {"id": identity["agent_id"], "name": identity["agent_name"]},
         "data": {
             "command": command,
-            "srcuser": "admin",
-            "dstuser": "root",
-            "pwd": "/home/admin",
+            "srcuser": identity["srcuser"],
+            "dstuser": identity["dstuser"],
+            "pwd": identity["pwd"],
         },
     }
     normalized = standardize(vectorizer.extract_vector(event), scaler_mean, scaler_var)
@@ -132,7 +170,7 @@ def validate(config_path: str) -> int:
     model.load_state_dict(torch.load(config["model_save_path"], map_location="cpu"))
     model.eval()
     vectorizer = LogVectorizer()
-    benign, malicious = load_corpora()
+    benign, malicious, identity = load_corpora()
 
     print(f"schema v{config.get('feature_schema_version', '?')}  tau={tau:.6f}\n")
     failures = 0
@@ -143,7 +181,12 @@ def validate(config_path: str) -> int:
         print(f"--- {label} (expected {'above' if should_alert else 'below'} tau) ---")
         for command in corpus:
             score = _score(
-                model, vectorizer, command, config["scaler_mean"], config["scaler_var"]
+                model,
+                vectorizer,
+                command,
+                config["scaler_mean"],
+                config["scaler_var"],
+                identity,
             )
             alerts = score > tau
             ok = alerts is should_alert
