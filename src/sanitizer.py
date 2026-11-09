@@ -15,7 +15,7 @@ import json
 import re
 from typing import Any, Dict, Optional
 
-from src.features import has_process_telemetry
+from src.features import flatten_audit_execve, has_process_telemetry
 
 # Constant markers used for irreversible substitution.
 MASKED_CREDENTIAL: str = "[MASKED_CREDENTIAL]"
@@ -26,7 +26,10 @@ MASKED_EMAIL: str = "user@masked.local"
 class ISOSanitizer:
     """Mask sensitive data in raw Wazuh events for ISO 27001 compliance."""
 
-    def __init__(self) -> None:
+    def __init__(self, include_audit_execve: bool = False) -> None:
+        # Off until a model has been trained on audit events: an untrained
+        # source would score as anomalous wholesale and flood the alert path.
+        self.include_audit_execve = include_audit_execve
         # PEM private key blocks (multi-line). Matched first so their inner
         # content is never picked up by the narrower patterns below.
         self._private_key_pattern = re.compile(
@@ -127,6 +130,9 @@ class ISOSanitizer:
             or "anomaly_detector" in data
         ):
             return None
+
+        if self.include_audit_execve:
+            data = flatten_audit_execve(data)
 
         # Only events carrying process/command telemetry hold behavioural
         # signal. Skip the rest (Wazuh's internal/periodic events, keepalives,

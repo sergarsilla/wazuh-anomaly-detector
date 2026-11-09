@@ -237,7 +237,7 @@ def run_realtime_inference(config_path: str = "config/global_config.json") -> No
     )
     config = load_config(config_path)
 
-    sanitizer = ISOSanitizer()
+    sanitizer = ISOSanitizer(include_audit_execve=bool(config.get("include_audit_execve", False)))
     vectorizer = LogVectorizer()
     injector = WazuhSocketInjector(config["wazuh_socket_path"])
     try:
