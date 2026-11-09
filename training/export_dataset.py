@@ -117,6 +117,7 @@ def build_vectors(
     archives_path: str,
     max_events: Optional[int] = None,
     max_per_command_per_day: Optional[int] = DEFAULT_MAX_PER_COMMAND_PER_DAY,
+    include_audit_execve: bool = False,
 ) -> np.ndarray:
     """Read archive logs and return an (n_events, INPUT_DIM) float32 array.
 
@@ -126,7 +127,7 @@ def build_vectors(
     Identical ``(day, agent, command)`` events beyond ``max_per_command_per_day``
     are dropped; ``None`` keeps every repeat.
     """
-    sanitizer = ISOSanitizer()
+    sanitizer = ISOSanitizer(include_audit_execve=include_audit_execve)
     vectorizer = LogVectorizer()
     vectors: List[np.ndarray] = []
     seen: Counter = Counter()
@@ -155,6 +156,7 @@ def export_dataset(
     validation_ratio: float = 0.2,
     max_events: Optional[int] = None,
     seed: int = 42,
+    include_audit_execve: bool = False,
 ) -> int:
     """Export feature vectors from an archives log into train/val ``.npy`` files.
 
@@ -165,11 +167,14 @@ def export_dataset(
             (0 disables the split and writes only ``normal_dataset.npy``).
         max_events: Optional cap on the number of events to process.
         seed: RNG seed for shuffling the training set, for reproducible runs.
+        include_audit_execve: Also learn from auditd ``execve`` records.
 
     Returns:
         The total number of feature vectors exported.
     """
-    vectors = build_vectors(archives_path, max_events=max_events)
+    vectors = build_vectors(
+        archives_path, max_events=max_events, include_audit_execve=include_audit_execve
+    )
     total = int(vectors.shape[0])
     os.makedirs(output_dir, exist_ok=True)
 
@@ -219,6 +224,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on number of events to process",
     )
+    parser.add_argument(
+        "--include-audit-execve",
+        action="store_true",
+        help="Also learn from auditd execve records",
+    )
     return parser.parse_args()
 
 
@@ -229,4 +239,5 @@ if __name__ == "__main__":
         args.output_dir,
         validation_ratio=args.val_ratio,
         max_events=args.max_events,
+        include_audit_execve=args.include_audit_execve,
     )
