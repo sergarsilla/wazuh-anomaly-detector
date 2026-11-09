@@ -24,14 +24,16 @@ import argparse
 import glob
 import gzip
 import os
+import re
 import sys
-from typing import IO, Iterator, List, Optional
+from collections import Counter
+from typing import IO, Iterator, List, Optional, Tuple
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.features import INPUT_DIM, LogVectorizer  # noqa: E402
+from src.features import INPUT_DIM, LogVectorizer, read_agent_id, read_command  # noqa: E402
 from src.sanitizer import ISOSanitizer  # noqa: E402
 
 
@@ -63,7 +65,20 @@ def resolve_archive_files(archives_path: str) -> List[str]:
         except OSError:
             continue
         unique_by_size.setdefault(size, path)
-    return sorted(unique_by_size.values())
+    return sorted(unique_by_size.values(), key=_chronological_key)
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_ROTATED_ARCHIVE = re.compile(r"(\d{4})/(" + "|".join(_MONTHS) + r")/ossec-archive-(\d{2})\.json")
+
+
+def _chronological_key(path: str) -> Tuple[int, int, int, str]:
+    """Order rotated archives by date; anything else (the live file) sorts last."""
+    match = _ROTATED_ARCHIVE.search(path)
+    if match is None:
+        return (9999, 0, 0, path)
+    year, month, day = match.groups()
+    return (int(year), _MONTHS.index(month) + 1, int(day), path)
 
 
 def _open_archive(path: str) -> IO[str]:
@@ -93,21 +108,39 @@ def iter_archive_lines(archives_path: str) -> Iterator[str]:
             print(f"Skipping unreadable archive {file_path}: {exc}", file=sys.stderr)
 
 
-def build_vectors(archives_path: str, max_events: Optional[int] = None) -> np.ndarray:
+# A scripted command repeated every second would otherwise outweigh everything
+# else the estate does; a few dozen copies a day already teach it as normal.
+DEFAULT_MAX_PER_COMMAND_PER_DAY = 50
+
+
+def build_vectors(
+    archives_path: str,
+    max_events: Optional[int] = None,
+    max_per_command_per_day: Optional[int] = DEFAULT_MAX_PER_COMMAND_PER_DAY,
+    include_audit_execve: bool = False,
+) -> np.ndarray:
     """Read archive logs and return an (n_events, INPUT_DIM) float32 array.
 
     ``archives_path`` may be a single file, a glob, or a directory (whose rotated
     ``*.json.gz`` history is read and decompressed too). Corrupt lines and events
     without useful telemetry are skipped silently, like the live pipeline does.
+    Identical ``(day, agent, command)`` events beyond ``max_per_command_per_day``
+    are dropped; ``None`` keeps every repeat.
     """
-    sanitizer = ISOSanitizer()
+    sanitizer = ISOSanitizer(include_audit_execve=include_audit_execve)
     vectorizer = LogVectorizer()
     vectors: List[np.ndarray] = []
+    seen: Counter = Counter()
 
     for line in iter_archive_lines(archives_path):
         event = sanitizer.process_event(line)
         if event is None:
             continue
+        if max_per_command_per_day is not None:
+            key = (str(event.get("timestamp", ""))[:10], read_agent_id(event), read_command(event["data"]))
+            seen[key] += 1
+            if seen[key] > max_per_command_per_day:
+                continue
         vectors.append(vectorizer.extract_vector(event))
         if max_events is not None and len(vectors) >= max_events:
             break
@@ -123,31 +156,31 @@ def export_dataset(
     validation_ratio: float = 0.2,
     max_events: Optional[int] = None,
     seed: int = 42,
+    include_audit_execve: bool = False,
 ) -> int:
     """Export feature vectors from an archives log into train/val ``.npy`` files.
 
     Args:
         archives_path: Path to the raw Wazuh ``archives.json`` capture.
         output_dir: Directory where the ``.npy`` files are written.
-        validation_ratio: Fraction of events held out for validation (0 disables
-            the split and writes only ``normal_dataset.npy``).
+        validation_ratio: Most recent fraction of events held out for validation
+            (0 disables the split and writes only ``normal_dataset.npy``).
         max_events: Optional cap on the number of events to process.
-        seed: RNG seed for the shuffle, for reproducible splits.
+        seed: RNG seed for shuffling the training set, for reproducible runs.
+        include_audit_execve: Also learn from auditd ``execve`` records.
 
     Returns:
         The total number of feature vectors exported.
     """
-    vectors = build_vectors(archives_path, max_events=max_events)
+    vectors = build_vectors(
+        archives_path, max_events=max_events, include_audit_execve=include_audit_execve
+    )
     total = int(vectors.shape[0])
     os.makedirs(output_dir, exist_ok=True)
 
     if total == 0:
         print("No usable events found; nothing was written.")
         return 0
-
-    # Shuffle so the train/val split is not biased by time ordering.
-    rng = np.random.default_rng(seed)
-    rng.shuffle(vectors)
 
     normal_path = os.path.join(output_dir, "normal_dataset.npy")
 
@@ -158,7 +191,11 @@ def export_dataset(
 
     split = int(total * (1.0 - validation_ratio))
     split = max(1, min(split, total - 1))  # keep at least one row in each set
-    train_set, validation_set = vectors[:split], vectors[split:]
+    # Vectors arrive in time order, so the validation set is the most recent
+    # traffic: tau must hold on days the model never saw, as it will in
+    # production. A random split calibrates it on days it was trained on.
+    train_set, validation_set = vectors[:split].copy(), vectors[split:]
+    np.random.default_rng(seed).shuffle(train_set)
 
     validation_path = os.path.join(output_dir, "validation_dataset.npy")
     np.save(normal_path, train_set)
@@ -187,6 +224,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional cap on number of events to process",
     )
+    parser.add_argument(
+        "--include-audit-execve",
+        action="store_true",
+        help="Also learn from auditd execve records",
+    )
     return parser.parse_args()
 
 
@@ -197,4 +239,5 @@ if __name__ == "__main__":
         args.output_dir,
         validation_ratio=args.val_ratio,
         max_events=args.max_events,
+        include_audit_execve=args.include_audit_execve,
     )

@@ -27,6 +27,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.config import load_config  # noqa: E402
 from training.evaluate import calculate_anomaly_threshold  # noqa: E402
 from training.export_dataset import export_dataset  # noqa: E402
 from training.train import train_model  # noqa: E402
@@ -41,8 +42,13 @@ def run_training(
     """Export, train and compute the threshold from archive logs."""
     with tempfile.TemporaryDirectory() as work_dir:
         print(f"[1/3] Exporting feature vectors from {archives_path} ...")
+        include_audit = bool(load_config(config_path).get("include_audit_execve", False))
         total = export_dataset(
-            archives_path, work_dir, validation_ratio=validation_ratio, max_events=max_events
+            archives_path,
+            work_dir,
+            validation_ratio=validation_ratio,
+            max_events=max_events,
+            include_audit_execve=include_audit,
         )
         if total == 0:
             raise SystemExit(

@@ -206,6 +206,29 @@ retrained `model.pt` and the new `feature_schema_version` / `scaler_*` /
 
 ---
 
+### Seeing more than sudo: auditd execve
+
+Out of the box the detector only sees commands run through `sudo`, because that
+is the only process telemetry a stock Wazuh agent forwards. A command run
+without sudo — a reverse shell in the user's own session, for instance — is
+invisible. auditd closes that gap: with an `execve` rule on the agent, Wazuh
+decodes every command into `data.audit`, and `include_audit_execve` maps those
+records onto the same features sudo events use.
+
+Enable it in this order, because a model never trained on audit events scores
+them all as anomalous:
+
+1. On the agent, add an execve rule for login sessions and forward the log:
+   ```
+   -a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=unset -k audit-wazuh-c
+   ```
+   ```xml
+   <localfile><log_format>audit</log_format><location>/var/log/audit/audit.log</location></localfile>
+   ```
+2. Leave `include_audit_execve` off and let normal traffic accumulate for a few
+   days. Watch the archive growth: every process in a pipeline is one event.
+3. Set it to `true`, retrain, run the acceptance check, then restart the detector.
+
 ## 💻 Local development
 
 For working on the code (tests, experimentation) without Docker:
@@ -246,6 +269,7 @@ All runtime settings live in [`config/global_config.json`](config/global_config.
 | `anomaly_threshold_tau` | Dynamic alarm threshold (written by `evaluate.py`) |
 | `tau_percentile` | Percentile of normal-traffic error used as the threshold (default 99.9) |
 | `alert_cooldown_seconds` | Per-signature throttle between repeat alerts, in seconds (default 1800) |
+| `include_audit_execve` | Also score auditd `execve` records, not only sudo (default `false`; see below) |
 | `scaler_mean` / `scaler_var` | Normalization params (written by `train.py`) |
 
 > `anomaly_threshold_tau`, `scaler_mean` and `scaler_var` start empty/zero and are
