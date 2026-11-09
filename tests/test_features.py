@@ -13,6 +13,7 @@ from src.features import (
     LogVectorizer,
     explain_anomaly,
     feature_layout,
+    has_process_telemetry,
     standardize,
     read_agent_id,
     read_process_name,
@@ -278,3 +279,15 @@ def test_indicator_weight_does_not_depend_on_how_rare_the_pattern_was() -> None:
     assert standardize(never_seen, scaler_mean, scaler_var)[
         _flag_index("credential_access")
     ] == INDICATOR_WEIGHT
+
+
+def test_process_inventory_rows_are_not_command_telemetry() -> None:
+    inventory = {"process": {"name": "docker-proxy", "args": "-proto udp", "euser": "root"}}
+
+    assert not has_process_telemetry(inventory)
+
+
+def test_process_name_ignores_structured_values() -> None:
+    data = {"process": {"name": "docker-proxy"}, "command": "/usr/bin/docker ps"}
+
+    assert read_process_name(data) == "docker"
