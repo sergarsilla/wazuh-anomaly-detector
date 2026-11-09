@@ -180,14 +180,23 @@ _FLAG_PATTERNS: Dict[str, re.Pattern[str]] = {
 }
 
 
+def _scalar_text(value: Any) -> str:
+    """Return a scalar field as stripped text; structured values yield ``""``."""
+    if isinstance(value, (dict, list)) or value is None:
+        return ""
+    return str(value).strip()
+
+
 def has_process_telemetry(data: Dict[str, Any]) -> bool:
-    """Return ``True`` if ``data`` carries usable process/command telemetry."""
+    """Return ``True`` if ``data`` carries usable process/command telemetry.
+
+    Only scalar fields count. Syscollector's process inventory carries
+    ``process`` as an object describing a running process, not a command that
+    was executed, and must not be scored as one.
+    """
     if not isinstance(data, dict):
         return False
-    return any(
-        data.get(key) is not None and str(data.get(key)).strip()
-        for key in _TELEMETRY_FIELDS
-    )
+    return any(_scalar_text(data.get(key)) for key in _TELEMETRY_FIELDS)
 
 
 def read_command(data: Dict[str, Any]) -> str:
@@ -208,9 +217,9 @@ def read_process_name(data: Dict[str, Any]) -> str:
     if not isinstance(data, dict):
         return "unknown"
     for alias in ("process_name", "process", "exe", "comm"):
-        value = data.get(alias)
-        if value is not None and str(value).strip():
-            return os.path.basename(str(value).strip())
+        value = _scalar_text(data.get(alias))
+        if value:
+            return os.path.basename(value)
 
     command = read_command(data).strip()
     if not command:
