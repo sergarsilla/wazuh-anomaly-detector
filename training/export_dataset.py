@@ -24,8 +24,9 @@ import argparse
 import glob
 import gzip
 import os
+import re
 import sys
-from typing import IO, Iterator, List, Optional
+from typing import IO, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -63,7 +64,20 @@ def resolve_archive_files(archives_path: str) -> List[str]:
         except OSError:
             continue
         unique_by_size.setdefault(size, path)
-    return sorted(unique_by_size.values())
+    return sorted(unique_by_size.values(), key=_chronological_key)
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_ROTATED_ARCHIVE = re.compile(r"(\d{4})/(" + "|".join(_MONTHS) + r")/ossec-archive-(\d{2})\.json")
+
+
+def _chronological_key(path: str) -> Tuple[int, int, int, str]:
+    """Order rotated archives by date; anything else (the live file) sorts last."""
+    match = _ROTATED_ARCHIVE.search(path)
+    if match is None:
+        return (9999, 0, 0, path)
+    year, month, day = match.groups()
+    return (int(year), _MONTHS.index(month) + 1, int(day), path)
 
 
 def _open_archive(path: str) -> IO[str]:
@@ -129,10 +143,10 @@ def export_dataset(
     Args:
         archives_path: Path to the raw Wazuh ``archives.json`` capture.
         output_dir: Directory where the ``.npy`` files are written.
-        validation_ratio: Fraction of events held out for validation (0 disables
-            the split and writes only ``normal_dataset.npy``).
+        validation_ratio: Most recent fraction of events held out for validation
+            (0 disables the split and writes only ``normal_dataset.npy``).
         max_events: Optional cap on the number of events to process.
-        seed: RNG seed for the shuffle, for reproducible splits.
+        seed: RNG seed for shuffling the training set, for reproducible runs.
 
     Returns:
         The total number of feature vectors exported.
@@ -145,10 +159,6 @@ def export_dataset(
         print("No usable events found; nothing was written.")
         return 0
 
-    # Shuffle so the train/val split is not biased by time ordering.
-    rng = np.random.default_rng(seed)
-    rng.shuffle(vectors)
-
     normal_path = os.path.join(output_dir, "normal_dataset.npy")
 
     if validation_ratio <= 0.0 or total < 2:
@@ -158,7 +168,11 @@ def export_dataset(
 
     split = int(total * (1.0 - validation_ratio))
     split = max(1, min(split, total - 1))  # keep at least one row in each set
-    train_set, validation_set = vectors[:split], vectors[split:]
+    # Vectors arrive in time order, so the validation set is the most recent
+    # traffic: tau must hold on days the model never saw, as it will in
+    # production. A random split calibrates it on days it was trained on.
+    train_set, validation_set = vectors[:split].copy(), vectors[split:]
+    np.random.default_rng(seed).shuffle(train_set)
 
     validation_path = os.path.join(output_dir, "validation_dataset.npy")
     np.save(normal_path, train_set)

@@ -133,3 +133,36 @@ def test_truncated_archive_does_not_abort_the_walk(tmp_path) -> None:
 
     assert any("ls -la" in line for line in lines)
     assert any("systemctl status" in line for line in lines)
+
+
+def test_rotated_archives_resolve_in_date_order(tmp_path: Path) -> None:
+    for month, day, size in (("Nov", "02", 3), ("Oct", "31", 4), ("Sep", "15", 5), ("Oct", "02", 6)):
+        directory = tmp_path / "2026" / month
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"ossec-archive-{day}.json.gz").write_bytes(b"x" * size)
+    (tmp_path / "archives.json").write_bytes(b"x" * 7)
+
+    names = [os.path.relpath(p, tmp_path) for p in resolve_archive_files(str(tmp_path))]
+
+    assert names == [
+        "2026/Sep/ossec-archive-15.json.gz",
+        "2026/Oct/ossec-archive-02.json.gz",
+        "2026/Oct/ossec-archive-31.json.gz",
+        "2026/Nov/ossec-archive-02.json.gz",
+        "archives.json",
+    ]
+
+
+def test_validation_is_the_most_recent_traffic(tmp_path: Path) -> None:
+    archives = tmp_path / "archives.json"
+    lines = [json.dumps({"agent": {"id": "001"}, "data": {"command": "x" * (i + 1)}}) for i in range(10)]
+    archives.write_text("\n".join(lines) + "\n")
+    out_dir = tmp_path / "data"
+
+    export_dataset(str(archives), str(out_dir), validation_ratio=0.2)
+
+    train = np.load(out_dir / "normal_dataset.npy")
+    validation = np.load(out_dir / "validation_dataset.npy")
+    # Dimension 0 is the command length, so the newest events are the longest.
+    assert sorted(validation[:, 0].tolist()) == [9.0, 10.0]
+    assert max(train[:, 0]) == 8.0
