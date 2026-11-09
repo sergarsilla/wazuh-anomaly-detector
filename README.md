@@ -206,6 +206,53 @@ retrained `model.pt` and the new `feature_schema_version` / `scaler_*` /
 
 ---
 
+### Retraining a running detector safely
+
+Step 3 writes the new weights, scaler and tau straight into the live config. On a
+detector already in service, train a candidate next to it instead, compare, and
+only then promote:
+
+```bash
+# Candidate config: same settings, its own model file
+sudo python3 -c "import json;c=json.load(open('config/global_config.json'));c['model_save_path']='models/candidate.pt';json.dump(c,open('models/candidate.config.json','w'),indent=2)"
+# Rotated days only, so today's archives.json stays unseen for the comparison below
+sudo docker compose run --rm --build -e CONFIG_PATH=models/candidate.config.json \
+  -e 'ARCHIVES_PATH=/var/ossec/logs/archives/*/*/ossec-archive-*.json.gz' trainer
+
+# Acceptance check on both; the candidate must not lose attacks or benign commands
+sudo docker compose run --rm trainer python scripts/validate_detection.py config/global_config.json
+sudo docker compose run --rm trainer python scripts/validate_detection.py models/candidate.config.json
+
+# Promote: keep the old config for rollback, then restart
+sudo cp -p config/global_config.json models/global_config.json.pre-promote
+sudo cp models/candidate.config.json config/global_config.json
+sudo docker compose restart detector
+```
+
+Keep candidates under `models/`: deployment syncs exclude it, while a stray
+file under `config/` is deleted by a `--delete` sync. Also compare how many
+events each model puts above tau on a day neither was trained on (today's
+`archives.json`, left out by the glob above): that number is the alert
+volume you will actually get.
+
+What the training set contains matters more than its size:
+
+- **Only executed commands count.** Process inventory and other structured
+  `process` objects are not telemetry and are skipped.
+- **Loops are capped.** A script running one command every second can outweigh
+  everything else the estate does; identical `(day, agent, command)` events
+  count at most 50 times.
+- **Tau is calibrated on the newest days.** A random validation split draws from
+  the days the model trained on and underestimates the tail of a new day.
+
+**Check where tau landed.** A set indicator flag adds about
+`INDICATOR_WEIGHT² / INPUT_DIM` (≈0.56) to the error. If the newest days
+include legitimate commands that set a flag, the percentile can land just above
+that value, and a one-indicator attack then scores barely over the threshold.
+When the acceptance check shows attacks at ~1.0x tau, set
+`anomaly_threshold_tau` by hand between the highest benign score and the
+lowest attack score it reports, and re-run the check.
+
 ### Seeing more than sudo: auditd execve
 
 Out of the box the detector only sees commands run through `sudo`, because that
@@ -286,7 +333,7 @@ All runtime settings live in [`config/global_config.json`](config/global_config.
 | CPU / RAM usage | `sudo docker stats wazuh-anomaly-detector` |
 | Are alerts reaching Wazuh? | `sudo tail -f /var/ossec/logs/alerts/alerts.json \| grep anomaly_detector` |
 | Stop everything | `sudo docker compose down` |
-| Retrain later | repeat step 3, then `sudo docker compose restart detector` |
+| Retrain later | see [Retraining a running detector safely](#retraining-a-running-detector-safely) |
 
 ---
 
