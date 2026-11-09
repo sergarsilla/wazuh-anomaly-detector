@@ -166,3 +166,19 @@ def test_validation_is_the_most_recent_traffic(tmp_path: Path) -> None:
     # Dimension 0 is the command length, so the newest events are the longest.
     assert sorted(validation[:, 0].tolist()) == [9.0, 10.0]
     assert max(train[:, 0]) == 8.0
+
+
+def test_a_command_repeated_all_day_is_capped(tmp_path: Path) -> None:
+    archives = tmp_path / "archives.json"
+    loop = {"timestamp": "2026-10-27T10:00:00.000+0000", "agent": {"id": "022"},
+            "data": {"command": "/usr/bin/ss -tnH state all", "srcuser": "admin"}}
+    other = dict(loop, data={"command": "/usr/bin/docker ps", "srcuser": "admin"})
+    next_day = dict(loop, timestamp="2026-10-28T10:00:00.000+0000")
+    lines = [json.dumps(loop)] * 500 + [json.dumps(other)] * 3 + [json.dumps(next_day)] * 5
+    archives.write_text("\n".join(lines) + "\n")
+
+    capped = build_vectors(str(archives), max_per_command_per_day=50)
+    uncapped = build_vectors(str(archives), max_per_command_per_day=None)
+
+    assert capped.shape[0] == 50 + 3 + 5
+    assert uncapped.shape[0] == 508

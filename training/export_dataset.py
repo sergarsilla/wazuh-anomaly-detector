@@ -26,13 +26,14 @@ import gzip
 import os
 import re
 import sys
+from collections import Counter
 from typing import IO, Iterator, List, Optional, Tuple
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.features import INPUT_DIM, LogVectorizer  # noqa: E402
+from src.features import INPUT_DIM, LogVectorizer, read_agent_id, read_command  # noqa: E402
 from src.sanitizer import ISOSanitizer  # noqa: E402
 
 
@@ -107,21 +108,38 @@ def iter_archive_lines(archives_path: str) -> Iterator[str]:
             print(f"Skipping unreadable archive {file_path}: {exc}", file=sys.stderr)
 
 
-def build_vectors(archives_path: str, max_events: Optional[int] = None) -> np.ndarray:
+# A scripted command repeated every second would otherwise outweigh everything
+# else the estate does; a few dozen copies a day already teach it as normal.
+DEFAULT_MAX_PER_COMMAND_PER_DAY = 50
+
+
+def build_vectors(
+    archives_path: str,
+    max_events: Optional[int] = None,
+    max_per_command_per_day: Optional[int] = DEFAULT_MAX_PER_COMMAND_PER_DAY,
+) -> np.ndarray:
     """Read archive logs and return an (n_events, INPUT_DIM) float32 array.
 
     ``archives_path`` may be a single file, a glob, or a directory (whose rotated
     ``*.json.gz`` history is read and decompressed too). Corrupt lines and events
     without useful telemetry are skipped silently, like the live pipeline does.
+    Identical ``(day, agent, command)`` events beyond ``max_per_command_per_day``
+    are dropped; ``None`` keeps every repeat.
     """
     sanitizer = ISOSanitizer()
     vectorizer = LogVectorizer()
     vectors: List[np.ndarray] = []
+    seen: Counter = Counter()
 
     for line in iter_archive_lines(archives_path):
         event = sanitizer.process_event(line)
         if event is None:
             continue
+        if max_per_command_per_day is not None:
+            key = (str(event.get("timestamp", ""))[:10], read_agent_id(event), read_command(event["data"]))
+            seen[key] += 1
+            if seen[key] > max_per_command_per_day:
+                continue
         vectors.append(vectorizer.extract_vector(event))
         if max_events is not None and len(vectors) >= max_events:
             break
